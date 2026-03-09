@@ -5,6 +5,7 @@ import asyncio
 import contextvars
 import heapq
 import json
+import logging
 import time
 from collections.abc import AsyncIterable, Coroutine, Sequence
 from dataclasses import dataclass
@@ -50,12 +51,13 @@ from .audio_recognition import (
 )
 from .events import (
     AgentFalseInterruptionEvent,
+    E2ETimingEvent,
     ErrorEvent,
     FunctionToolsExecutedEvent,
     MetricsCollectedEvent,
     SpeechCreatedEvent,
     UserInputTranscribedEvent,
-    UserStateChangedEvent
+    UserStateChangedEvent,
 )
 from .generation import (
     ToolExecutionOutput,
@@ -71,6 +73,7 @@ from .generation import (
     update_instructions,
 )
 from .speech_handle import SpeechHandle
+from .wake_policy import FaceWakeHandler
 
 if TYPE_CHECKING:
     from ..llm import mcp
@@ -114,8 +117,12 @@ class AgentActivity(RecognitionHooks):
         self._closed = False
         self._scheduling_paused = True
 
-        # kws 是否唤醒 标志
+        # kws 是否唤醒 标志（KWS 逻辑保持不动）
         self.is_awake = False
+        self._face_wake: FaceWakeHandler | None = None
+        if not self._session.options.kws_enabled:
+            self._face_wake = FaceWakeHandler()
+            self.is_awake = True
 
         self._current_speech: SpeechHandle | None = None
         self._speech_q: list[tuple[int, float, SpeechHandle]] = []
@@ -146,9 +153,9 @@ class AgentActivity(RecognitionHooks):
         self._kws_queue = asyncio.Queue()
         self._kws_task: asyncio.Task | None = None
 
-        if self._session.options.kws_enabled:
-            self._session.on("user_state_changed", self._on_user_state_changed)
-        
+        # KWS 与 Face 均需监听 away，以便播休眠语并通知 client
+        self._session.on("user_state_changed", self._on_user_state_changed)
+
         # KWS 诊断模式
 
 
@@ -604,9 +611,11 @@ class AgentActivity(RecognitionHooks):
             turn_detection=self._turn_detection,
         )
         self._audio_recognition.start()
-        # kws 控制
-        # logger.info("[KWS DEBUG] Starting KWS task...")
-        self._kws_task = asyncio.create_task(self._run_kws())
+        # kws 控制（原有 KWS 代码不动）
+        if self._session.options.kws_enabled:
+            self._kws_task = asyncio.create_task(self._run_kws())
+        else:
+            await self._face_wake.on_session_start(self)
 
     @tracer.start_as_current_span("drain_agent_activity")
     async def drain(self) -> None:
@@ -768,21 +777,17 @@ class AgentActivity(RecognitionHooks):
 
 
         if not self._started:
-            # print("\n检测到并非开始\n")
             return
-        # print("\n\n\npush_audio\n\n\n", self.is_awake)
         if not self.is_awake:
-            # print("未唤醒")
             self._kws_queue.put_nowait(frame.data.tobytes())
             return
-        # print("\n\n 唤醒了 \n\n")
         should_discard = bool(
             self._current_speech
             and not self._current_speech.allow_interruptions
             and self._session.options.discard_audio_if_uninterruptible
         )
         # 如果没有唤醒，则持续将音频帧推入kws队列
-
+        # print("push_audio to kws_queue")
         # 如果已经唤醒，则持续将音频帧推入rt_session，处理stt/vad逻辑
         if not should_discard:
             if self._rt_session is not None:
@@ -792,46 +797,6 @@ class AgentActivity(RecognitionHooks):
         # VAD needs frames to detect speech end and update user state correctly
         if self._audio_recognition is not None:
             self._audio_recognition.push_audio(frame, skip_stt=should_discard)
-        
-        # KWS 诊断录制
-        # if self._kws_diag_enabled and not self._kws_diag_done:
-        #     if self._kws_diag_start_time is None:
-        #         self._kws_diag_start_time = time.time()
-        #         logger.info("🔬 [KWS DIAG] 开始录制诊断音频...")
-            
-        #     self._kws_diag_buffer.append(audio_bytes)
-        #     elapsed = time.time() - self._kws_diag_start_time
-            
-        #     if elapsed >= self._kws_diag_duration:
-        #         self._kws_diag_done = True
-        #         self._save_diagnostic_audio()
-    
-    # def _save_diagnostic_audio(self):
-    #     """保存诊断音频数据"""
-    #     try:
-    #         combined = b''.join(self._kws_diag_buffer)
-    #         audio_data = np.frombuffer(combined, dtype=np.int16)
-            
-    #         # 保存到 livekit/kws/diagnostics 目录
-    #         output_dir = os.path.join(os.path.dirname(__file__), "../../../../kws/diagnostics")
-    #         output_dir = os.path.abspath(output_dir)
-    #         os.makedirs(output_dir, exist_ok=True)
-            
-    #         timestamp = time.strftime("%Y%m%d_%H%M%S")
-    #         filename = f"livekit_agent_{timestamp}"
-    #         npy_path = os.path.join(output_dir, f"{filename}.npy")
-    #         np.save(npy_path, audio_data)
-            
-    #         # 打印统计信息
-    #         audio_float = audio_data.astype(np.float32)
-    #         logger.info(f"🔬 [KWS DIAG] 诊断录制完成!")
-    #         logger.info(f"   保存路径: {npy_path}")
-    #         logger.info(f"   采样数: {len(audio_data)}")
-    #         logger.info(f"   振幅范围: [{audio_float.min():.0f}, {audio_float.max():.0f}]")
-    #         logger.info(f"   RMS: {np.sqrt(np.mean(audio_float**2)):.2f}")
-            
-    #     except Exception as e:
-    #         logger.error(f"[KWS DIAG] 保存失败: {e}")
 
     async def _run_kws(self):
         # logger.info("[KWS DEBUG] _run_kws task started")
@@ -860,10 +825,8 @@ class AgentActivity(RecognitionHooks):
                             response = json.loads(msg)
                             msg_type = response.get("type")
                             if msg_type == "wake_detected":
-
                                 if response.get("success"):
                                     self.is_awake = True
-                                    logger.info(f"\n 收到唤醒信号 \n")
                                     self.say("我在呢", allow_interruptions=False)
 
                                     # 转移状态
@@ -890,11 +853,25 @@ class AgentActivity(RecognitionHooks):
             self.say("我先休息了，有事再叫我吧", allow_interruptions=False)
             self.is_awake = False
 
+            asyncio.create_task(self._notify_client_sleep())
+
             while not self._kws_queue.empty():
                 try:
                     self._kws_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+
+    ## 通知client进入休眠函数
+    async def _notify_client_sleep(self):
+        logger.debug("发送休眠通知")
+        try:
+            await self._session._room_io.room.local_participant.publish_data(
+                b"session_end",
+                reliable=True
+            )
+            logger.debug("通知client进入休眠")
+        except Exception as e:
+            logger.error(f"通知client进入休眠失败: {e}")
 
     def push_video(self, frame: rtc.VideoFrame) -> None:
         if not self._started:
@@ -1151,6 +1128,7 @@ class AgentActivity(RecognitionHooks):
                 pass
 
         speech._mark_scheduled()
+        logger.info(f"[TIMING] _schedule_speech: 入队完成, 队列长度={len(self._speech_q)}")
         self._wake_up_scheduling_task()
 
     @utils.log_exceptions(logger=logger)
@@ -1168,14 +1146,18 @@ class AgentActivity(RecognitionHooks):
                     continue
                 self._current_speech = speech
                 if self.min_consecutive_speech_delay > 0.0:
-                    await asyncio.sleep(
-                        self.min_consecutive_speech_delay - (time.time() - last_playout_ts)
-                    )
+                    _delay_start = time.time()
+                    _actual_delay = self.min_consecutive_speech_delay - (time.time() - last_playout_ts)
+                    if _actual_delay > 0:
+                        logger.info(f"[TIMING] _scheduling_task: 等待 min_consecutive_speech_delay={_actual_delay*1000:.1f}ms")
+                    await asyncio.sleep(_actual_delay)
+                    logger.info(f"[TIMING] _scheduling_task: delay 等待完成, 实际等待={((time.time() - _delay_start)*1000):.1f}ms")
                     # check again if speech is done after sleep delay
                     if speech.done():
                         # skip done speech (interrupted during delay)
                         self._current_speech = None
                         continue
+                logger.info(f"[TIMING] _scheduling_task: 授权 speech 开始生成")
                 speech._authorize_generation()
                 await speech._wait_for_generation()
                 self._current_speech = None
@@ -1350,10 +1332,12 @@ class AgentActivity(RecognitionHooks):
 
                 self._current_speech.interrupt()
 
+            logging.getLogger("pipeline").info("[VAD] 用户打断")
+
     # region recognition hooks
 
     def on_start_of_speech(self, ev: vad.VADEvent | None) -> None:
-        logger.info(f"\n\n🔥 [VAD] 语音开始 (Speaking Started) | Probability: {getattr(ev, 'probability', 'N/A')}\n\n")
+        logger.debug("VAD speech started (probability=%s)", getattr(ev, "probability", "N/A"))
         self._session._update_user_state("speaking")
         self._user_silence_event.clear()
 
@@ -1363,8 +1347,8 @@ class AgentActivity(RecognitionHooks):
             self._false_interruption_timer = None
 
     def on_end_of_speech(self, ev: vad.VADEvent | None) -> None:
-        duration = getattr(ev, 'speech_duration', 0.0) if ev else 0.0
-        logger.info(f"\n\n🔥 [VAD] 语音结束 (Speaking Stopped) | Duration: {duration:.2f}s\n\n")
+        duration = getattr(ev, "speech_duration", 0.0) if ev else 0.0
+        logger.debug("VAD speech stopped (duration=%.2fs)", duration)
 
         speech_end_time = time.time()
         if ev:
@@ -1765,7 +1749,7 @@ class AgentActivity(RecognitionHooks):
             else None
         )
         audio_output = self._session.output.audio if self._session.output.audio_enabled else None
-        logger.info(f"\n in _tts_task_impl audio_output: {audio_output}\n")
+        # logger.info(f"\n in _tts_task_impl audio_output: {audio_output}\n")
         # See discussion in https://github.com/livekit/agents/issues/4432
         authorization_tasks: list[asyncio.Future[Any]] = [
             asyncio.ensure_future(speech_handle._wait_for_authorization())
@@ -1815,7 +1799,7 @@ class AgentActivity(RecognitionHooks):
                     model_settings=model_settings,
                     text_transforms=self._session.options.tts_text_transforms,
                 )
-                logger.info(f"\n\n in perform tts inference !\n\n")
+                # logger.info(f"\n\n in perform tts inference !\n\n")
                 tasks.append(tts_task)
                 if (
                     self.use_tts_aligned_transcript
@@ -1999,6 +1983,12 @@ class AgentActivity(RecognitionHooks):
         read_transcript_from_tts = False
         if audio_output is not None:
             await llm_gen_data.started_fut  # make sure tts span starts after llm span
+            await llm_gen_data.first_chunk_fut  # 等流式循环里真正发出第一个 chunk 再打点
+            try:
+                self._session.emit("e2e_timing", E2ETimingEvent(llm_first_token=time.time()))
+            except Exception:
+                pass
+
             tts_task, tts_gen_data = perform_tts_inference(
                 node=self._agent.tts_node,
                 input=tts_text_input,

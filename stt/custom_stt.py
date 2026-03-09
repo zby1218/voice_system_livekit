@@ -6,7 +6,7 @@ import json
 import ssl
 import time
 from dataclasses import dataclass
-from typing import Any, Optional, List
+from typing import Any, Callable, Optional, List
 import logging
 
 import aiohttp
@@ -20,6 +20,8 @@ from livekit.agents import (
     stt,
     utils,
 )
+from livekit.agents.metrics import STTMetrics
+from livekit.agents.metrics.base import Metadata
 
 # ===== FunASR 常用输入参数 =====
 SAMPLE_RATE = 16000
@@ -69,6 +71,7 @@ class MySTT(stt.STT):
         hotwords: str = "",
         itn: bool = True,
         chunk_ms: int | None = None,
+        on_segment_submitted: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -100,6 +103,7 @@ class MySTT(stt.STT):
             itn=itn,
             chunk_ms=chunk_ms,
         )
+        self._on_segment_submitted = on_segment_submitted  # 音频段提交给 STT 时回调，用于 E2E 起点
 
         self._session: aiohttp.ClientSession | None = None
 
@@ -121,7 +125,12 @@ class MySTT(stt.STT):
         language: Any = None,  # FunASR ws 协议里一般不需要 language，这里保持兼容签名
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> "SpeechStream":
-        return SpeechStream(stt=self, pool=self._pool, conn_options=conn_options)
+        return SpeechStream(
+            stt=self,
+            pool=self._pool,
+            conn_options=conn_options,
+            on_segment_submitted=self._on_segment_submitted,
+        )
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         if not self._session:
@@ -288,16 +297,20 @@ class SpeechStream(stt.SpeechStream):
         stt: MySTT,
         conn_options: APIConnectOptions,
         pool: utils.ConnectionPool[aiohttp.ClientWebSocketResponse],
+        on_segment_submitted: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(stt=stt, conn_options=conn_options, sample_rate=SAMPLE_RATE)
         self._stt: MySTT = stt
         self._pool = pool
+        self._on_segment_submitted = on_segment_submitted
 
         self._reconnect_event = asyncio.Event()
 
         # utterance state
         self._utt_id = 0
         self._speaking = False  # whether we've started an utterance on server
+        self._utt_audio_bytes = 0  # 当前句已发送的 PCM 字节数，用于 STTMetrics.audio_duration
+        self._inference_start_at = None  # 发送 is_speaking=False 的时间，用于 STTMetrics.duration
         self._trace = {
             "utt_id": 0,
             "cfg_sent_ts": None,
@@ -327,6 +340,7 @@ class SpeechStream(stt.SpeechStream):
     def _ts(self) -> float:
         return time.perf_counter()
 
+
     def _reset_trace_for_new_utt(self) -> None:
         self._trace.update(
             cfg_sent_ts=None,
@@ -336,6 +350,16 @@ class SpeechStream(stt.SpeechStream):
             first_text_ts=None,
             final_text_ts=None,
         )
+
+    def push_frame(self, frame: rtc.AudioFrame | stt.RecognizeStream._FlushSentinel) -> None:
+        # intercept FlushSentinel
+        from livekit.agents.types import FlushSentinel
+        if isinstance(frame, FlushSentinel):
+            # print(f"[MySTT] 🛑 Intercepted FlushSentinel in push_frame, triggering flush()", flush=True)
+            self.flush()
+            return
+        
+        super().push_frame(frame)
 
 
     @utils.log_exceptions(logger=logging.getLogger("my_stt"))
@@ -365,6 +389,7 @@ class SpeechStream(stt.SpeechStream):
                 if self._speaking:
                     return
                 self._utt_id += 1
+                self._utt_audio_bytes = 0
                 cfg = self._build_start_config(wav_name=f"livekit_{self._utt_id}")
                 # print(f"[MySTT] 🎙️ 开始新话语 utt_id={self._utt_id}", flush=True)
                 await ws.send_str(json.dumps(cfg, ensure_ascii=False))
@@ -384,19 +409,22 @@ class SpeechStream(stt.SpeechStream):
                     frames.extend(audio_bstream.write(data.data.tobytes()))
 
                 elif isinstance(data, self._FlushSentinel):
-                    # flush 可能是：
-                    # 1) end_input() 触发（一句话结束）
-                    # 2) stream 关闭时的收尾
+                    # flush 可能是：end_input() 触发 或 stream 关闭时的收尾
                     frames.extend(audio_bstream.flush())
 
-                    # 先把残余 chunk 发完
+                    # 先把残余 chunk 发完，并计入当前句音频长度
                     for frame in frames:
-                        await ws.send_bytes(frame.data.tobytes())
+                        frame_bytes = frame.data.tobytes()
+                        self._utt_audio_bytes += len(frame_bytes)
+                        await ws.send_bytes(frame_bytes)
 
                     frames.clear()
 
-                    # 发送 is_speaking=false 作为句末 finalize
+                    # 发送 is_speaking=false 作为句末 finalize（音频流已给到 STT server，用于 E2E 起点）
                     if self._speaking:
+                        self._inference_start_at = time.time()
+                        if self._on_segment_submitted:
+                            self._on_segment_submitted()
                         await ws.send_str(json.dumps({"is_speaking": False}))
                         self._speaking = False
 
@@ -406,6 +434,7 @@ class SpeechStream(stt.SpeechStream):
                 for frame in frames:
                     frame_bytes = frame.data.tobytes()
                     bytes_sent += len(frame_bytes)
+                    self._utt_audio_bytes += len(frame_bytes)
                     await ws.send_bytes(frame_bytes)
 
             # 输入通道结束：关闭连接
@@ -479,6 +508,23 @@ class SpeechStream(stt.SpeechStream):
                             alternatives=[stt.SpeechData(text=text, language="")],
                         )
                     )
+                    # 上报 STT 推理耗时，供 pipeline 打日志
+                    if self._inference_start_at is not None and self._stt._label:
+                        duration = time.time() - self._inference_start_at
+                        audio_duration = self._utt_audio_bytes / (SAMPLE_RATE * 2) if self._utt_audio_bytes else 0.0
+                        self._stt.emit(
+                            "metrics_collected",
+                            STTMetrics(
+                                label=self._stt._label,
+                                request_id=f"livekit_{self._utt_id}",
+                                timestamp=time.time(),
+                                duration=duration,
+                                audio_duration=audio_duration,
+                                streamed=True,
+                                metadata=Metadata(model_name="FunASR", model_provider=self._stt.provider),
+                            ),
+                        )
+                        self._inference_start_at = None
 
         # 主循环：从连接池拿 ws，起 send/recv 两个协程
         while True:

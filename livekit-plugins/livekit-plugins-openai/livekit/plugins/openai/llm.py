@@ -159,6 +159,7 @@ class LLM(llm.LLM):
                 if timeout
                 else httpx.Timeout(connect=15.0, read=5.0, write=5.0, pool=5.0),
                 follow_redirects=True,
+                trust_env=False,
                 limits=httpx.Limits(
                     max_connections=50,
                     max_keepalive_connections=50,

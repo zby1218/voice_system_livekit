@@ -89,6 +89,7 @@ EventTypes = Literal[
     "agent_false_interruption",
     "function_tools_executed",
     "metrics_collected",
+    "e2e_timing",
     "speech_created",
     "error",
     "close",
@@ -143,6 +144,12 @@ class MetricsCollectedEvent(BaseModel):
     type: Literal["metrics_collected"] = "metrics_collected"
     metrics: AgentMetrics
     created_at: float = Field(default_factory=time.time)
+
+
+class E2ETimingEvent(BaseModel):
+    """流式 LLM 发出第一个 chunk 时的时刻，用于 pipeline 打点（STT结果→首chunk）。"""
+    type: Literal["e2e_timing"] = "e2e_timing"
+    llm_first_token: float | None = None  # 首 chunk 时刻（与 STT 结果时刻相减即 STT→首chunk 耗时）
 
 
 class _TypeDiscriminator(BaseModel):
@@ -232,6 +239,7 @@ AgentEvent = Annotated[
         AgentStateChangedEvent,
         AgentFalseInterruptionEvent,
         MetricsCollectedEvent,
+        E2ETimingEvent,
         ConversationItemAddedEvent,
         FunctionToolsExecutedEvent,
         SpeechCreatedEvent,

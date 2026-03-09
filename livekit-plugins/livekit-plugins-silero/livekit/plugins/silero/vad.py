@@ -377,6 +377,8 @@ class VADStream(agents.vad.VADStream):
                 p = await self._loop.run_in_executor(None, self._model, inference_f32_data)
                 p = self._exp_filter.apply(exp=1.0, sample=p)
 
+                # logger.info(f"\n\n [VAD] Probability: {p:.4f} \n\n")
+
                 window_duration = self._model.window_size_samples / self._opts.sample_rate
 
                 pub_current_sample += self._model.window_size_samples

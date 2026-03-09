@@ -32,7 +32,34 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def _setup_logging(log_subdir: str, log_filename: str) -> None:
+    """配置日志：同时输出到控制台和文件，每次启动清空日志文件"""
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    log_dir = os.path.join(project_root, "log", log_subdir)
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, log_filename)
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(fmt)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(fmt)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers.clear()
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
+
 logger = logging.getLogger(__name__)
 
 # ========== 音色配置 ==========
@@ -402,7 +429,8 @@ async def interrupt():
 
 def main():
     global tts_engine
-    
+    _setup_logging("tts", "tts.log")
+
     # 默认路径
     default_model_dir = os.path.join(SCRIPT_DIR, "model", "Fun-CosyVoice3-0.5B")
     default_asset_dir = os.path.join(SCRIPT_DIR, "assets")
@@ -415,7 +443,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", help="设备 (cuda/cpu)")
     parser.add_argument("--fp16", action="store_true", default=True, help="使用 FP16")
     parser.add_argument("--no-fp16", action="store_false", dest="fp16", help="不使用 FP16")
-    parser.add_argument("--vllm", action="store_true", default=False, help="使用 vLLM")
+    parser.add_argument("--vllm", action="store_true", default=True, help="使用 vLLM")
     parser.add_argument("--sample-rate", type=int, default=24000, help="输出采样率")
     parser.add_argument("--max-concurrent", type=int, default=2, help="最大并发请求数 (32GB 显存建议 2-3)")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="监听地址")

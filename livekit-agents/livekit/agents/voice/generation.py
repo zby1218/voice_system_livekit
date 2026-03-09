@@ -51,6 +51,7 @@ class _LLMGenerationData:
     generated_functions: list[llm.FunctionCall] = field(default_factory=list)
     id: str = field(default_factory=lambda: utils.shortuuid("item_"))
     started_fut: asyncio.Future[None] = field(default_factory=asyncio.Future)
+    first_chunk_fut: asyncio.Future[None] = field(default_factory=asyncio.Future)
     ttft: float | None = None
 
 
@@ -73,6 +74,8 @@ def perform_llm_inference(
     def _cleanup(_: asyncio.Task[bool]) -> None:
         if not data.started_fut.done():
             data.started_fut.set_result(None)
+        if not data.first_chunk_fut.done():
+            data.first_chunk_fut.set_result(None)
 
     llm_task.add_done_callback(_cleanup)
 
@@ -136,6 +139,8 @@ async def _llm_inference_task(
             if isinstance(chunk, str):
                 data.generated_text += chunk
                 text_ch.send_nowait(chunk)
+                if not data.first_chunk_fut.done():
+                    data.first_chunk_fut.set_result(None)
 
             elif isinstance(chunk, ChatChunk):
                 if not chunk.delta:
@@ -159,6 +164,8 @@ async def _llm_inference_task(
                 if chunk.delta.content:
                     data.generated_text += chunk.delta.content
                     text_ch.send_nowait(chunk.delta.content)
+                    if not data.first_chunk_fut.done():
+                        data.first_chunk_fut.set_result(None)
 
             elif isinstance(chunk, FlushSentinel):
                 text_ch.send_nowait(chunk)

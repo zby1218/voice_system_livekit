@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from livekit import rtc
 
@@ -53,6 +54,7 @@ class _ParticipantAudioOutput(io.AudioOutput):
         self._forwarding_task: asyncio.Task[None] | None = None
 
         self._pushed_duration: float = 0.0
+        self._first_frame_time: float | None = None
 
         self._playback_enabled = asyncio.Event()
         self._playback_enabled.set()
@@ -101,8 +103,17 @@ class _ParticipantAudioOutput(io.AudioOutput):
         for f in self._audio_bstream.push(frame.data):
             await self._audio_buf.send(f)
             self._pushed_duration += f.duration
-            # if self._pushed_duration < 0.5 or int(self._pushed_duration * 10) % 5 == 0:
-                # logger.info(f"📨 [RoomIO] capture_frame -> buf | dur: {self._pushed_duration:.2f}s")
+            if self._first_frame_time is None:
+                self._first_frame_time = time.time()
+                _h_time = time.strftime('%H:%M:%S', time.localtime(self._first_frame_time)) + f".{int((self._first_frame_time % 1) * 1000):03d}"
+                logger.info(f"\n📦 [RoomIO] {_h_time} 首帧进入 capture_frame")
+                # 读取 ASR 时间并计算 E2E 延迟
+                from . import _e2e_asr_time
+                if _e2e_asr_time.asr_result_time is not None:
+                    _e2e_dur = (self._first_frame_time - _e2e_asr_time.asr_result_time) * 1000
+                    if _e2e_dur < 10000:  # 只显示 10 秒内的延迟
+                        logger.info(f"\n🌐 [E2E] ASR结果 -> RoomIO首帧 端到端延迟: {_e2e_dur:.1f}ms\n")
+                    _e2e_asr_time.asr_result_time = None  # 清除
 
     def flush(self) -> None:
         super().flush()
@@ -159,6 +170,7 @@ class _ParticipantAudioOutput(io.AudioOutput):
         pushed_duration = self._pushed_duration
 
         if interrupted:
+            logger.info("\n\n\n🛑 [RoomIO] Playback INTERRUPTED by user! Clearing queue...\n\n\n")
             queued_duration = self._audio_source.queued_duration
             while not self._audio_buf.empty():
                 queued_duration += self._audio_buf.recv_nowait().duration
@@ -170,6 +182,7 @@ class _ParticipantAudioOutput(io.AudioOutput):
             wait_for_interruption.cancel()
 
         self._pushed_duration = 0
+        self._first_frame_time = None
         self._interrupted_event.clear()
         self.on_playback_finished(playback_position=pushed_duration, interrupted=interrupted)
 
@@ -184,6 +197,10 @@ class _ParticipantAudioOutput(io.AudioOutput):
                 # logger.info("▶️ [RoomIO] _forward_audio playback_enabled set")
                 # TODO(long): save the frames in the queue and play them later
                 # TODO(long): ignore frames from previous syllable
+            
+            if self._pushed_duration == 0:
+                 logger.info(f"⏱️ [Timing] Playback Start: {time.time()}")
+
 
             if self._interrupted_event.is_set() or self._pushed_duration == 0:
                 # logger.warning(f"⏭️ [RoomIO] Skipping frame! Interrupted: {self._interrupted_event.is_set()}, PushedDur: {self._pushed_duration}")
@@ -193,9 +210,13 @@ class _ParticipantAudioOutput(io.AudioOutput):
                 # ignore frames if interrupted
                 continue
 
-            # logger.info(f"⏳ [RoomIO] Calling source.capture_frame | dur: {frame.duration}")
             await self._audio_source.capture_frame(frame)
-            # logger.info(f"ab [RoomIO] _forward_audio -> source.capture | dur: {frame.duration:.3f}s")
+            if self._first_frame_time is not None:
+                _now = time.time()
+                _h_time = time.strftime('%H:%M:%S', time.localtime(_now)) + f".{int((_now % 1) * 1000):03d}"
+                _dur = (_now - self._first_frame_time) * 1000
+                logger.info(f"\n🚀 [RoomIO] {_h_time} 首帧发送到 RTC | capture->RTC: {_dur:.1f}ms")
+                self._first_frame_time = None  # 只打印一次
 
     def _on_reconnected(self) -> None:
         if self._republish_task:

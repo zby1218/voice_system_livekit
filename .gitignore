@@ -1,10 +1,4 @@
 # ============================================
-# livekit 资源文件 (LFS 对象缺失，不提交)
-# ============================================
-livekit-agents/livekit/agents/resources/*.ogg
-livekit-plugins/livekit-plugins-silero/livekit/plugins/silero/resources/*.onnx
-
-# ============================================
 # STT / TTS 模型 (体积大，不提交到 GitHub)
 # ============================================
 stt/model/
@@ -56,3 +50,4 @@ kws/diagnostics/
 .pytest_cache/
 .coverage
 htmlcov/
+vllm-omni/

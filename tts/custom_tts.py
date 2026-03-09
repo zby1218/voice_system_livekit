@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass, replace
-from typing import Optional, Literal, Tuple, Dict, Any, List
+from typing import Callable, Optional, Literal, Tuple, Dict, Any, List
 
 import httpx
 from livekit.agents import (
@@ -89,6 +89,8 @@ class CosyVoiceTTS(tts.TTS):
         segment_deadline_s: float = 180.0,
 
         client: Optional[httpx.AsyncClient] = None,
+        on_first_frame_pushed: Optional[Callable[[], None]] = None,
+        on_tts_request_sent: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=False),
@@ -119,6 +121,8 @@ class CosyVoiceTTS(tts.TTS):
 
         # ✅ prompt wav bytes 缓存（zero_shot/cross_lingual 每段都要带）
         self._prompt_cache: Optional[bytes] = None
+        self._on_first_frame_pushed = on_first_frame_pushed  # TTS 首帧 push 时回调，用于 E2E 终点
+        self._on_tts_request_sent = on_tts_request_sent  # 向 TTS server 发送请求前回调，用于计时「请求→首帧」
 
         self._client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(
@@ -128,6 +132,7 @@ class CosyVoiceTTS(tts.TTS):
                 pool=None,
             ),
             follow_redirects=True,
+            trust_env=False,
             limits=httpx.Limits(
                 max_connections=50,
                 max_keepalive_connections=50,
@@ -335,6 +340,7 @@ class CosyVoiceChunkedStream(tts.ChunkedStream):
 
             loop = asyncio.get_event_loop()
             start_ts = loop.time()
+            e2e_end_recorded = False  # 整轮只记一次首帧（第一段的首帧）
 
             total_deadline = float(getattr(self._conn_options, "timeout", self._opts.total_timeout_s))
 
@@ -345,6 +351,9 @@ class CosyVoiceChunkedStream(tts.ChunkedStream):
 
                     url, data, files = self._build_request_for_segment(seg)
                     candidates = (url, url + "/")  # 兼容尾部 /
+
+                    if idx == 0 and self._tts._on_tts_request_sent:
+                        self._tts._on_tts_request_sent()
 
                     last_err: Optional[Exception] = None
                     ok = False
@@ -381,8 +390,10 @@ class CosyVoiceChunkedStream(tts.ChunkedStream):
                                     raise APITimeoutError() from None
 
                                 if first:
-                                    # _logger.info(f"🎵 [CosyVoiceTTS] 首包收到 {len(first)} 字节")
                                     output_emitter.push(first)
+                                    if self._tts._on_first_frame_pushed and not e2e_end_recorded:
+                                        self._tts._on_first_frame_pushed()
+                                        e2e_end_recorded = True
 
                                 # ========= 单段整体 deadline（防卡死）=========
                                 seg_end_at = loop.time() + float(self._opts.segment_deadline_s)

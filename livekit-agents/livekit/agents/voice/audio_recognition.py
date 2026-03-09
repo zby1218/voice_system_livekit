@@ -16,7 +16,7 @@ from livekit import rtc
 from .. import llm, stt, utils, vad
 from ..log import logger
 from ..telemetry import trace_types, tracer
-from ..types import NOT_GIVEN, NotGivenOr
+from ..types import NOT_GIVEN, FlushSentinel, NotGivenOr
 from ..utils import aio, is_given
 from . import io
 from ._utils import _set_participant_attributes
@@ -370,6 +370,11 @@ class AudioRecognition:
             self._audio_transcript = self._audio_transcript.lstrip()
             self._final_transcript_confidence.append(confidence)
             transcript_changed = self._audio_transcript != self._audio_preflight_transcript
+            _now = time.time()
+            # 记录 ASR 结果时间到全局变量（供其他模块使用）
+            from .room_io import _e2e_asr_time
+            _e2e_asr_time.asr_result_time = _now
+            
             self._audio_interim_transcript = ""
             self._audio_preflight_transcript = ""
             self._final_transcript_received.set()
@@ -492,6 +497,13 @@ class AudioRecognition:
                 self._hooks.on_end_of_speech(ev)
 
             self._speaking = False
+            
+            # [FIX] Force flush STT on VAD end to trigger recognition
+            if self._stt_ch:
+                try:
+                    self._stt_ch.send_nowait(FlushSentinel())
+                except Exception:
+                    pass
 
             if self._vad_base_turn_detection or (
                 self._turn_detection_mode == "stt" and self._user_turn_committed
@@ -501,7 +513,6 @@ class AudioRecognition:
 
     def _run_eou_detection(self, chat_ctx: llm.ChatContext) -> None:
         if self._stt and not self._audio_transcript and self._turn_detection_mode != "manual":
-            # stt enabled but no transcript yet
             return
 
         chat_ctx = chat_ctx.copy()
@@ -619,6 +630,7 @@ class AudioRecognition:
 
                 # clear the transcript if the user turn was committed
                 self._audio_transcript = ""
+
                 self._final_transcript_confidence = []
                 self._last_speaking_time = None
                 self._last_final_transcript_time = None

@@ -15,6 +15,7 @@ from ...types import (
     TOPIC_TRANSCRIPTION,
 )
 from .. import io
+from ..playback_boundary_log import default_logger as playback_boundary_log
 from ..transcription import find_micro_track_id
 
 
@@ -55,6 +56,8 @@ class _ParticipantAudioOutput(io.AudioOutput):
 
         self._pushed_duration: float = 0.0
         self._first_frame_time: float | None = None
+        self._boundary_frame_count: int = 0
+        self._track_submit_count: int = 0
 
         self._playback_enabled = asyncio.Event()
         self._playback_enabled.set()
@@ -101,6 +104,8 @@ class _ParticipantAudioOutput(io.AudioOutput):
             await self._flush_task
 
         for f in self._audio_bstream.push(frame.data):
+            self._boundary_frame_count += 1
+            playback_boundary_log.log_output_received(frame_index=self._boundary_frame_count)
             await self._audio_buf.send(f)
             self._pushed_duration += f.duration
             if self._first_frame_time is None:
@@ -137,7 +142,10 @@ class _ParticipantAudioOutput(io.AudioOutput):
 
         if not self._pushed_duration:
             return
+        playback_boundary_log.log_clear(reason="clear_buffer")
         self._interrupted_event.set()
+        # 打断时立即清空已送入 RTC 轨道的队列，避免「上一句首段」继续播完（见文档 10.2）
+        self._audio_source.clear_queue()
 
     def pause(self) -> None:
         super().pause()
@@ -171,6 +179,7 @@ class _ParticipantAudioOutput(io.AudioOutput):
 
         if interrupted:
             logger.info("\n\n\n🛑 [RoomIO] Playback INTERRUPTED by user! Clearing queue...\n\n\n")
+            playback_boundary_log.log_clear(reason="clear_queue_in_playout")
             queued_duration = self._audio_source.queued_duration
             while not self._audio_buf.empty():
                 queued_duration += self._audio_buf.recv_nowait().duration
@@ -210,6 +219,8 @@ class _ParticipantAudioOutput(io.AudioOutput):
                 # ignore frames if interrupted
                 continue
 
+            self._track_submit_count += 1
+            playback_boundary_log.log_track_submit(frame_index=self._track_submit_count)
             await self._audio_source.capture_frame(frame)
             if self._first_frame_time is not None:
                 _now = time.time()

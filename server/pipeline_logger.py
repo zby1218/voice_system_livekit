@@ -46,7 +46,7 @@ def init_pipeline_logging(log_dir: str, log_filename: str = "pipeline.log") -> N
     _logger.handlers.clear()
 
     fmt = _MilliFormatter("%(asctime)s %(message)s", datefmt="%H:%M:%S")
-    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(fmt)
     _logger.addHandler(file_handler)

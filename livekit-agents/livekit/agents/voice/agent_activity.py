@@ -1073,6 +1073,10 @@ class AgentActivity(RecognitionHooks):
         if self._rt_session is not None:
             self._rt_session.interrupt()
 
+        # 打断时立即清空播放缓冲与 RTC 轨道队列（见文档 10.3）
+        if self._session.output.audio is not None:
+            self._session.output.audio.clear_buffer()
+
         if not interrupted_speeches:
             future.set_result(None)
         else:
@@ -1331,6 +1335,9 @@ class AgentActivity(RecognitionHooks):
                     self._rt_session.interrupt()
 
                 self._current_speech.interrupt()
+                # 打断时立即清空播放缓冲与 RTC 轨道队列（见文档 10.3）
+                if self._session.output.audio is not None:
+                    self._session.output.audio.clear_buffer()
 
             logging.getLogger("pipeline").info("[VAD] 用户打断")
 
@@ -1568,6 +1575,10 @@ class AgentActivity(RecognitionHooks):
 
             if self._rt_session is not None:
                 self._rt_session.interrupt()
+
+            # 打断时立即清空播放缓冲与 RTC 轨道队列，避免已送入轨道的「上一句首段」继续播完（见文档 10.3）
+            if self._session.output.audio is not None:
+                self._session.output.audio.clear_buffer()
 
         user_message = llm.ChatMessage(
             role="user",

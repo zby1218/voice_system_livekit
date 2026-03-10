@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import socket
 from dataclasses import dataclass, replace
 from typing import Callable, Optional, Literal, Tuple, Dict, Any, List
 
@@ -53,6 +55,8 @@ class _CosyVoiceTTSOptions:
     # ===== HTTP 行为 =====
     connect_timeout_s: float = 15.0
     total_timeout_s: float = 600.0
+    session_id: str = ""
+    interrupt_mode: str = "latest_only"
 
     # 首包等待（zero_shot / cross_lingual 首包可能较慢）
     first_audio_deadline_s: float = 60.0
@@ -87,6 +91,8 @@ class CosyVoiceTTS(tts.TTS):
         total_timeout_s: float = 600.0,
         first_audio_deadline_s: float = 60.0,
         segment_deadline_s: float = 180.0,
+        session_id: Optional[str] = None,
+        interrupt_mode: str = "latest_only",
 
         client: Optional[httpx.AsyncClient] = None,
         on_first_frame_pushed: Optional[Callable[[], None]] = None,
@@ -114,6 +120,8 @@ class CosyVoiceTTS(tts.TTS):
             total_timeout_s=float(total_timeout_s),
             first_audio_deadline_s=float(first_audio_deadline_s),
             segment_deadline_s=float(segment_deadline_s),
+            session_id=session_id or f"{socket.gethostname()}:{os.getpid()}",
+            interrupt_mode=interrupt_mode or "latest_only",
         )
 
         # ✅ 全局串行锁：避免多 stream 交错导致“乱序/重复读体感”
@@ -162,6 +170,8 @@ class CosyVoiceTTS(tts.TTS):
         total_timeout_s: Optional[float] = None,
         first_audio_deadline_s: Optional[float] = None,
         segment_deadline_s: Optional[float] = None,
+        session_id: Optional[str] = None,
+        interrupt_mode: Optional[str] = None,
     ) -> None:
         if endpoint is not None:
             self._opts.endpoint = endpoint
@@ -186,6 +196,10 @@ class CosyVoiceTTS(tts.TTS):
             self._opts.first_audio_deadline_s = float(first_audio_deadline_s)
         if segment_deadline_s is not None:
             self._opts.segment_deadline_s = float(segment_deadline_s)
+        if session_id is not None:
+            self._opts.session_id = session_id
+        if interrupt_mode is not None:
+            self._opts.interrupt_mode = interrupt_mode
 
     def synthesize(
         self, text: str, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
@@ -288,10 +302,14 @@ class CosyVoiceChunkedStream(tts.ChunkedStream):
 
     def _build_request_for_segment(self, seg_text: str) -> Tuple[str, Dict[str, Any], Optional[Dict[str, Any]]]:
         files = None
+        common = {
+            "session_id": self._opts.session_id,
+            "interrupt_mode": self._opts.interrupt_mode,
+        }
 
         if self._opts.endpoint == "sft":
             url = f"{self._opts.base_url}/inference_sft"
-            data = {"tts_text": seg_text, "spk_id": self._opts.voice}
+            data = {"tts_text": seg_text, "spk_id": self._opts.voice, **common}
             return url, data, files
 
         if self._opts.endpoint == "instruct":
@@ -300,12 +318,13 @@ class CosyVoiceChunkedStream(tts.ChunkedStream):
                 "tts_text": seg_text,
                 "spk_id": self._opts.voice,
                 "instruct_text": self._opts.instructions or "",
+                **common,
             }
             return url, data, files
 
         if self._opts.endpoint == "cross_lingual":
             url = f"{self._opts.base_url}/inference_cross_lingual"
-            data = {"tts_text": seg_text}
+            data = {"tts_text": seg_text, **common}
             wav_bytes = self._read_prompt_bytes()
             files = {"prompt_wav": ("prompt.wav", wav_bytes, "audio/wav")}
             return url, data, files
@@ -315,7 +334,11 @@ class CosyVoiceChunkedStream(tts.ChunkedStream):
             url = f"{self._opts.base_url}/inference_zero_shot"
             if not self._opts.prompt_text:
                 raise ValueError("zero_shot requires prompt_text")
-            data = {"tts_text": seg_text, "prompt_text": self._opts.prompt_text}
+            data = {
+                "tts_text": seg_text,
+                "prompt_text": self._opts.prompt_text,
+                **common,
+            }
             wav_bytes = self._read_prompt_bytes()
             files = {"prompt_wav": ("prompt.wav", wav_bytes, "audio/wav")}
             return url, data, files

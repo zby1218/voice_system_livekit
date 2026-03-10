@@ -35,6 +35,14 @@ os.makedirs(_log_dir, exist_ok=True)
 # 流水线日志：控制台 + log/agent/pipeline.log，带时间戳
 init_pipeline_logging(_log_dir, "pipeline.log")
 
+# 播放边界打点：log/agent/playback_boundary.log，用于分析残留播放位置（agent 侧）
+try:
+    from livekit.agents.voice.playback_boundary_log import init_playback_boundary_file_logging
+    init_playback_boundary_file_logging(_log_dir, "playback_boundary.log")
+    logging.getLogger("playback_boundary").info("PlaybackBoundary 日志将写入: %s", os.path.join(_log_dir, "playback_boundary.log"))
+except Exception as e:
+    logging.warning("PlaybackBoundary 文件日志未初始化: %s", e)
+
 # 抑制所有 livekit/agents 的 INFO，只保留本进程的 pipeline 流水线日志，避免刷屏
 for _name in (
     "livekit",

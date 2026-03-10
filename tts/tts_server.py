@@ -12,33 +12,35 @@ import logging
 import argparse
 import threading
 import asyncio
-from typing import Generator, Dict, Any, Optional
+from typing import Generator, Dict, Any, Optional, Literal
 
-# 路径设置
+# 路径设置（必须在导入同目录模块之前）
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 MODEL_DIR = os.path.join(SCRIPT_DIR, "model")
-
-# 添加当前目录到路径，以便导入本地 cosyvoice 模块
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-# 添加 Matcha-TTS 路径 (如果需要)
+from tts_request_metrics import RequestMetricsRecorder
+from tts_request_control import SessionRequestController, RequestTicket
+
+# 添加 Matcha-TTS 路径（如需要）
 matcha_path = os.path.join(SCRIPT_DIR, 'third_party', 'Matcha-TTS')
 if os.path.exists(matcha_path) and matcha_path not in sys.path:
     sys.path.insert(0, matcha_path)
 
-from fastapi import FastAPI, Form, UploadFile, File, HTTPException
+from fastapi import FastAPI, Form, UploadFile, File, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 
-def _setup_logging(log_subdir: str, log_filename: str) -> None:
-    """配置日志：同时输出到控制台和文件，每次启动清空日志文件"""
+def _setup_logging() -> None:
+    """配置日志：同时输出到控制台和文件。日志写在项目根目录的 log/tts/ 下，与 agent、stt 等一致。每次启动覆盖旧文件。"""
+    # 与 stt 一致：用 abspath(__file__) 解析项目根，避免 cwd 或 uvicorn 加载方式导致路径错误
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    log_dir = os.path.join(project_root, "log", log_subdir)
+    log_dir = os.path.join(project_root, "log", "tts")
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, log_filename)
+    log_path = os.path.join(log_dir, "tts.log")
 
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -53,14 +55,19 @@ def _setup_logging(log_subdir: str, log_filename: str) -> None:
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(fmt)
 
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
-    root_logger.handlers.clear()
-    root_logger.addHandler(file_handler)
-    root_logger.addHandler(console_handler)
+    # 只配置 tts_server 的 logger，不依赖 root，避免 uvicorn 等后续清空 root.handlers 导致文件无内容
+    tts_logger = logging.getLogger("tts_server")
+    tts_logger.setLevel(logging.INFO)
+    tts_logger.propagate = False
+    tts_logger.handlers.clear()
+    tts_logger.addHandler(file_handler)
+    tts_logger.addHandler(console_handler)
+    tts_logger.info("TTS 日志文件: %s", os.path.abspath(log_path))
+    file_handler.flush()
 
 
-logger = logging.getLogger(__name__)
+# 使用固定名称，避免以脚本运行时显示为 __main__
+logger = logging.getLogger("tts_server")
 
 # ========== 音色配置 ==========
 VOICE_CONFIGS = [
@@ -73,6 +80,28 @@ VOICE_CONFIGS = [
     {"id": "longyingmu", "file": "longyingmu_woman.wav",
      "prompt_text": "You are a helpful assistant.<|endofprompt|>您好，我是智能电话助手，很高兴为您服务。请问您需要咨询业务预约办理还是查询信息？"}
 ]
+
+
+class RequestCancelledError(RuntimeError):
+    """请求在排队或推理阶段被取消。"""
+
+
+InterruptMode = Literal["normal", "latest_only"]
+
+
+def _normalize_interrupt_mode(mode: Optional[str]) -> InterruptMode:
+    v = (mode or "normal").strip().lower()
+    if v in ("latest", "latest_only", "interrupt", "interrupting"):
+        return "latest_only"
+    return "normal"
+
+
+def _resolve_session_id(session_id: Optional[str], request: Request) -> str:
+    # 推荐由调用方显式透传 session_id；未透传时回退到客户端地址，避免全局冲突。
+    if session_id and session_id.strip():
+        return session_id.strip()
+    host = request.client.host if request.client else "unknown"
+    return f"client:{host}"
 
 
 class TTSEngine:
@@ -98,10 +127,11 @@ class TTSEngine:
         # 使用信号量控制最大并发数（替代原来的串行锁）
         self._semaphore = threading.Semaphore(max_concurrent)
         self._active_count = 0
-        self._total_requests = 0
         self._count_lock = threading.Lock()
-        
-        self._interrupted_flags: Dict[int, threading.Event] = {}  # request_id -> Event
+        self._request_control = SessionRequestController()
+        self._request_metrics: Dict[int, RequestMetricsRecorder] = {}  # request_id -> 单次请求指标记录器
+        self._request_ticket: Dict[int, RequestTicket] = {}  # request_id -> ticket(session/event)
+        self._total_requests = 0
         self.loaded = False
     
     def load_model(self):
@@ -158,27 +188,105 @@ class TTSEngine:
                 "total_requests": self._total_requests,
                 "available_slots": self.max_concurrent - self._active_count,
             }
-    
-    def _acquire_slot(self) -> int:
-        """获取一个推理槽位，返回请求 ID"""
-        self._semaphore.acquire()
+
+    def _register_request(self, session_id: str, interrupt_mode: InterruptMode) -> int:
+        ticket, cancelled = self._request_control.create_request(session_id, interrupt_mode)
+        request_id = ticket.request_id
         with self._count_lock:
-            self._total_requests += 1
+            self._total_requests = max(self._total_requests, request_id)
+            self._request_ticket[request_id] = ticket
+            recorder = RequestMetricsRecorder(self.logger)
+            recorder.start_acquire()
+            self._request_metrics[request_id] = recorder
+
+        self.logger.info(
+            "📨 [Arrive] 请求 #%s 到达 | session=%s mode=%s",
+            request_id,
+            session_id,
+            interrupt_mode,
+        )
+        if cancelled:
+            self.logger.info(
+                "🛑 [Cancel] session=%s latest_only 取消旧请求: %s",
+                session_id,
+                cancelled,
+            )
+            for rid in cancelled:
+                rec = self._request_metrics.get(rid)
+                if rec is not None:
+                    rec.record_cancelled("queued_or_running")
+        return request_id
+
+    def _acquire_slot(self, request_id: int) -> None:
+        """等待并占用推理槽位；若排队阶段已被取消则抛 RequestCancelledError。"""
+        while True:
+            if self._request_control.is_cancelled(request_id):
+                raise RequestCancelledError(f"request #{request_id} cancelled before acquire")
+            if self._semaphore.acquire(timeout=0.1):
+                break
+
+        with self._count_lock:
             self._active_count += 1
-            request_id = self._total_requests
-            self._interrupted_flags[request_id] = threading.Event()
-            self.logger.info(f"📥 [Slot] 请求 #{request_id} 开始 | 当前并发: {self._active_count}/{self.max_concurrent}")
-            return request_id
-    
-    def _release_slot(self, request_id: int) -> None:
-        """释放推理槽位"""
+            recorder = self._request_metrics.get(request_id)
+            if recorder is not None:
+                recorder.finish_acquire(request_id, self._active_count)
+            ticket = self._request_ticket.get(request_id)
+            session = ticket.session_id if ticket else "unknown"
+            self.logger.info(
+                "📥 [Slot] 请求 #%s 开始 | session=%s 当前并发: %s/%s",
+                request_id,
+                session,
+                self._active_count,
+                self.max_concurrent,
+            )
+
+    def _release_slot(self, request_id: int, *, cancelled: bool = False) -> None:
+        """释放推理槽位并清理请求状态。"""
+        recorder = None
+        session = self._request_control.remove_request(request_id) or "unknown"
         with self._count_lock:
-            self._active_count -= 1
-            self._interrupted_flags.pop(request_id, None)
-            self.logger.info(f"📤 [Slot] 请求 #{request_id} 完成 | 当前并发: {self._active_count}/{self.max_concurrent}")
+            if self._active_count > 0:
+                self._active_count -= 1
+            recorder = self._request_metrics.pop(request_id, None)
+            self._request_ticket.pop(request_id, None)
+            self.logger.info(
+                "📤 [Slot] 请求 #%s 结束 | session=%s status=%s 当前并发: %s/%s",
+                request_id,
+                session,
+                "cancelled" if cancelled else "completed",
+                self._active_count,
+                self.max_concurrent,
+            )
         self._semaphore.release()
+        if recorder is not None:
+            if cancelled:
+                recorder.record_cancelled("running")
+            else:
+                recorder.finish_request()
+
+    def _drop_request_without_slot(self, request_id: int, reason: str) -> None:
+        """未拿到槽位时清理请求（例如排队阶段被取消）。"""
+        session = self._request_control.remove_request(request_id) or "unknown"
+        with self._count_lock:
+            recorder = self._request_metrics.pop(request_id, None)
+            self._request_ticket.pop(request_id, None)
+        if recorder is not None:
+            recorder.record_cancelled("queued")
+        self.logger.info(
+            "🧹 [Drop] 请求 #%s 已丢弃 | session=%s reason=%s",
+            request_id,
+            session,
+            reason,
+        )
     
-    def synthesize(self, text: str, voice_id: str = None) -> Generator[bytes, None, None]:
+    def synthesize(
+        self,
+        text: str,
+        voice_id: str = None,
+        *,
+        session_id: str = "default",
+        interrupt_mode: InterruptMode = "normal",
+    ) -> Generator[bytes, None, None]:
         """流式合成 - 返回 PCM 字节流（支持并发）"""
         if not self.loaded or not text.strip():
             return
@@ -190,24 +298,48 @@ class TTSEngine:
             raise ValueError("无可用音色")
         
         voice = self.voice_cache[vid]
-        request_id = self._acquire_slot()
-        
+        request_id = self._register_request(session_id, interrupt_mode)
+        acquired = False
+        cancelled = False
         try:
-            interrupted_flag = self._interrupted_flags.get(request_id)
+            self._acquire_slot(request_id)
+            acquired = True
+            first_chunk = True
             for result in self.cosyvoice.inference_zero_shot(
                 text, voice["prompt_text"], voice["file"], stream=True, zero_shot_spk_id=vid
             ):
-                if interrupted_flag and interrupted_flag.is_set():
-                    self.logger.info(f"⚠️ 请求 #{request_id} 被中断")
+                if self._request_control.is_cancelled(request_id):
+                    cancelled = True
+                    self.logger.info("⚠️ 请求 #%s 在推理阶段被取消", request_id)
                     break
+                if first_chunk:
+                    rec = self._request_metrics.get(request_id)
+                    if rec is not None:
+                        rec.record_first_byte()
+                    first_chunk = False
                 audio = result['tts_speech']
                 if self.output_sample_rate != self.model_sample_rate:
-                    audio = self.torchaudio.functional.resample(audio, self.model_sample_rate, self.output_sample_rate)
+                    audio = self.torchaudio.functional.resample(
+                        audio, self.model_sample_rate, self.output_sample_rate
+                    )
                 yield (audio * 32768).to(self.torch.int16).cpu().numpy().tobytes()
+        except RequestCancelledError:
+            cancelled = True
+            self.logger.info("⚠️ 请求 #%s 在排队阶段被取消", request_id)
         finally:
-            self._release_slot(request_id)
+            if acquired:
+                self._release_slot(request_id, cancelled=cancelled)
+            else:
+                self._drop_request_without_slot(request_id, "cancelled_before_acquire")
     
-    def synthesize_cross_lingual(self, text: str, prompt_wav_bytes: bytes) -> Generator[bytes, None, None]:
+    def synthesize_cross_lingual(
+        self,
+        text: str,
+        prompt_wav_bytes: bytes,
+        *,
+        session_id: str = "default",
+        interrupt_mode: InterruptMode = "normal",
+    ) -> Generator[bytes, None, None]:
         """跨语言合成 - 使用上传的参考音频（支持并发）"""
         if not self.loaded or not text.strip():
             return
@@ -218,23 +350,46 @@ class TTSEngine:
             f.write(prompt_wav_bytes)
             temp_path = f.name
         
-        request_id = self._acquire_slot()
-        
+        request_id = self._register_request(session_id, interrupt_mode)
+        acquired = False
+        cancelled = False
         try:
-            interrupted_flag = self._interrupted_flags.get(request_id)
+            self._acquire_slot(request_id)
+            acquired = True
+            first_chunk = True
             for result in self.cosyvoice.inference_cross_lingual(text, temp_path, stream=True):
-                if interrupted_flag and interrupted_flag.is_set():
-                    self.logger.info(f"⚠️ 请求 #{request_id} 被中断")
+                if self._request_control.is_cancelled(request_id):
+                    cancelled = True
+                    self.logger.info("⚠️ 请求 #%s 在推理阶段被取消", request_id)
                     break
+                if first_chunk:
+                    rec = self._request_metrics.get(request_id)
+                    if rec is not None:
+                        rec.record_first_byte()
+                    first_chunk = False
                 audio = result['tts_speech']
                 if self.output_sample_rate != self.model_sample_rate:
                     audio = self.torchaudio.functional.resample(audio, self.model_sample_rate, self.output_sample_rate)
                 yield (audio * 32768).to(self.torch.int16).cpu().numpy().tobytes()
+        except RequestCancelledError:
+            cancelled = True
+            self.logger.info("⚠️ 请求 #%s 在排队阶段被取消", request_id)
         finally:
-            self._release_slot(request_id)
+            if acquired:
+                self._release_slot(request_id, cancelled=cancelled)
+            else:
+                self._drop_request_without_slot(request_id, "cancelled_before_acquire")
             os.unlink(temp_path)
     
-    def synthesize_zero_shot(self, text: str, prompt_text: str, prompt_wav_bytes: bytes) -> Generator[bytes, None, None]:
+    def synthesize_zero_shot(
+        self,
+        text: str,
+        prompt_text: str,
+        prompt_wav_bytes: bytes,
+        *,
+        session_id: str = "default",
+        interrupt_mode: InterruptMode = "normal",
+    ) -> Generator[bytes, None, None]:
         """零样本合成 - 优先使用预注册音色（支持并发）"""
         if not self.loaded or not text.strip():
             return
@@ -250,22 +405,37 @@ class TTSEngine:
         if matched_voice_id:
             # 使用预注册音色（与 voice_system 一致）
             voice = self.voice_cache[matched_voice_id]
-            request_id = self._acquire_slot()
-            
+            request_id = self._register_request(session_id, interrupt_mode)
+            acquired = False
+            cancelled = False
             try:
-                interrupted_flag = self._interrupted_flags.get(request_id)
+                self._acquire_slot(request_id)
+                acquired = True
+                first_chunk = True
                 for result in self.cosyvoice.inference_zero_shot(
                     text, voice["prompt_text"], voice["file"], stream=True, zero_shot_spk_id=matched_voice_id
                 ):
-                    if interrupted_flag and interrupted_flag.is_set():
-                        self.logger.info(f"⚠️ 请求 #{request_id} 被中断")
+                    if self._request_control.is_cancelled(request_id):
+                        cancelled = True
+                        self.logger.info("⚠️ 请求 #%s 在推理阶段被取消", request_id)
                         break
+                    if first_chunk:
+                        rec = self._request_metrics.get(request_id)
+                        if rec is not None:
+                            rec.record_first_byte()
+                        first_chunk = False
                     audio = result['tts_speech']
                     if self.output_sample_rate != self.model_sample_rate:
                         audio = self.torchaudio.functional.resample(audio, self.model_sample_rate, self.output_sample_rate)
                     yield (audio * 32768).to(self.torch.int16).cpu().numpy().tobytes()
+            except RequestCancelledError:
+                cancelled = True
+                self.logger.info("⚠️ 请求 #%s 在排队阶段被取消", request_id)
             finally:
-                self._release_slot(request_id)
+                if acquired:
+                    self._release_slot(request_id, cancelled=cancelled)
+                else:
+                    self._drop_request_without_slot(request_id, "cancelled_before_acquire")
         else:
             # 未匹配到预注册音色，使用临时文件（冷推理）
             self.logger.warning(f"⚠️ 未匹配到预注册音色，使用冷推理")
@@ -274,28 +444,41 @@ class TTSEngine:
                 f.write(prompt_wav_bytes)
                 temp_path = f.name
             
-            request_id = self._acquire_slot()
-            
+            request_id = self._register_request(session_id, interrupt_mode)
+            acquired = False
+            cancelled = False
             try:
-                interrupted_flag = self._interrupted_flags.get(request_id)
+                self._acquire_slot(request_id)
+                acquired = True
+                first_chunk = True
                 for result in self.cosyvoice.inference_zero_shot(text, prompt_text, temp_path, stream=True):
-                    if interrupted_flag and interrupted_flag.is_set():
-                        self.logger.info(f"⚠️ 请求 #{request_id} 被中断")
+                    if self._request_control.is_cancelled(request_id):
+                        cancelled = True
+                        self.logger.info("⚠️ 请求 #%s 在推理阶段被取消", request_id)
                         break
+                    if first_chunk:
+                        rec = self._request_metrics.get(request_id)
+                        if rec is not None:
+                            rec.record_first_byte()
+                        first_chunk = False
                     audio = result['tts_speech']
                     if self.output_sample_rate != self.model_sample_rate:
                         audio = self.torchaudio.functional.resample(audio, self.model_sample_rate, self.output_sample_rate)
                     yield (audio * 32768).to(self.torch.int16).cpu().numpy().tobytes()
+            except RequestCancelledError:
+                cancelled = True
+                self.logger.info("⚠️ 请求 #%s 在排队阶段被取消", request_id)
             finally:
-                self._release_slot(request_id)
+                if acquired:
+                    self._release_slot(request_id, cancelled=cancelled)
+                else:
+                    self._drop_request_without_slot(request_id, "cancelled_before_acquire")
                 os.unlink(temp_path)
     
     def interrupt_all(self):
         """中断所有正在进行的请求"""
-        with self._count_lock:
-            for event in self._interrupted_flags.values():
-                event.set()
-            self.logger.info(f"⚠️ 中断所有 {len(self._interrupted_flags)} 个请求")
+        cancelled = self._request_control.cancel_all()
+        self.logger.info("⚠️ 中断所有请求，共 %s 个: %s", len(cancelled), cancelled)
 
 
 # ========== FastAPI 应用 ==========
@@ -321,19 +504,32 @@ async def health():
 
 
 @app.post("/inference_sft")
-async def inference_sft(tts_text: str = Form(...), spk_id: str = Form(default="default")):
+async def inference_sft(
+    request: Request,
+    tts_text: str = Form(...),
+    spk_id: str = Form(default="default"),
+    session_id: Optional[str] = Form(default=None),
+    interrupt_mode: str = Form(default="normal"),
+):
     """SFT 推理 (预训练音色)"""
     if not tts_engine or not tts_engine.loaded:
         raise HTTPException(503, "模型未加载")
     if not tts_text.strip():
         raise HTTPException(400, "文本为空")
     
-    logger.info(f"[SFT] text='{tts_text[:30]}...' voice={spk_id}")
+    session = _resolve_session_id(session_id, request)
+    mode = _normalize_interrupt_mode(interrupt_mode)
+    logger.info(f"[SFT] session={session} mode={mode} text='{tts_text[:30]}...' voice={spk_id}")
     start_time = time.time()
     
     def gen():
         first = True
-        for chunk in tts_engine.synthesize(tts_text, voice_id=spk_id):
+        for chunk in tts_engine.synthesize(
+            tts_text,
+            voice_id=spk_id,
+            session_id=session,
+            interrupt_mode=mode,
+        ):
             if first:
                 logger.info(f"[SFT] ⏱️ 首包延迟: {time.time() - start_time:.3f}s")
                 first = False
@@ -344,7 +540,13 @@ async def inference_sft(tts_text: str = Form(...), spk_id: str = Form(default="d
 
 
 @app.post("/inference_cross_lingual")
-async def inference_cross_lingual(tts_text: str = Form(...), prompt_wav: UploadFile = File(...)):
+async def inference_cross_lingual(
+    request: Request,
+    tts_text: str = Form(...),
+    prompt_wav: UploadFile = File(...),
+    session_id: Optional[str] = Form(default=None),
+    interrupt_mode: str = Form(default="normal"),
+):
     """跨语言推理 (上传参考音频)"""
     if not tts_engine or not tts_engine.loaded:
         raise HTTPException(503, "模型未加载")
@@ -352,12 +554,19 @@ async def inference_cross_lingual(tts_text: str = Form(...), prompt_wav: UploadF
         raise HTTPException(400, "文本为空")
     
     prompt_bytes = await prompt_wav.read()
-    logger.info(f"[CrossLingual] text='{tts_text[:30]}...'")
+    session = _resolve_session_id(session_id, request)
+    mode = _normalize_interrupt_mode(interrupt_mode)
+    logger.info(f"[CrossLingual] session={session} mode={mode} text='{tts_text[:30]}...'")
     start_time = time.time()
     
     def gen():
         first = True
-        for chunk in tts_engine.synthesize_cross_lingual(tts_text, prompt_bytes):
+        for chunk in tts_engine.synthesize_cross_lingual(
+            tts_text,
+            prompt_bytes,
+            session_id=session,
+            interrupt_mode=mode,
+        ):
             if first:
                 logger.info(f"[CrossLingual] ⏱️ 首包延迟: {time.time() - start_time:.3f}s")
                 first = False
@@ -368,7 +577,14 @@ async def inference_cross_lingual(tts_text: str = Form(...), prompt_wav: UploadF
 
 
 @app.post("/inference_zero_shot")
-async def inference_zero_shot(tts_text: str = Form(...), prompt_text: str = Form(...), prompt_wav: UploadFile = File(...)):
+async def inference_zero_shot(
+    request: Request,
+    tts_text: str = Form(...),
+    prompt_text: str = Form(...),
+    prompt_wav: UploadFile = File(...),
+    session_id: Optional[str] = Form(default=None),
+    interrupt_mode: str = Form(default="normal"),
+):
     """零样本推理 (上传参考音频和文本)"""
     if not tts_engine or not tts_engine.loaded:
         raise HTTPException(503, "模型未加载")
@@ -378,12 +594,22 @@ async def inference_zero_shot(tts_text: str = Form(...), prompt_text: str = Form
         raise HTTPException(400, "参考文本为空")
     
     prompt_bytes = await prompt_wav.read()
-    logger.info(f"[ZeroShot] text='{tts_text[:30]}...' prompt='{prompt_text[:20]}...'")
+    session = _resolve_session_id(session_id, request)
+    mode = _normalize_interrupt_mode(interrupt_mode)
+    logger.info(
+        f"[ZeroShot] session={session} mode={mode} text='{tts_text[:30]}...' prompt='{prompt_text[:20]}...'"
+    )
     start_time = time.time()
     
     def gen():
         first = True
-        for chunk in tts_engine.synthesize_zero_shot(tts_text, prompt_text, prompt_bytes):
+        for chunk in tts_engine.synthesize_zero_shot(
+            tts_text,
+            prompt_text,
+            prompt_bytes,
+            session_id=session,
+            interrupt_mode=mode,
+        ):
             if first:
                 logger.info(f"[ZeroShot] ⏱️ 首包延迟: {time.time() - start_time:.3f}s")
                 first = False
@@ -394,19 +620,32 @@ async def inference_zero_shot(tts_text: str = Form(...), prompt_text: str = Form
 
 
 @app.post("/tts/stream")
-async def tts_stream(text: str = Form(...), voice_id: Optional[str] = Form(default=None)):
+async def tts_stream(
+    request: Request,
+    text: str = Form(...),
+    voice_id: Optional[str] = Form(default=None),
+    session_id: Optional[str] = Form(default=None),
+    interrupt_mode: str = Form(default="normal"),
+):
     """简化版 TTS 接口 (兼容 voice_system)"""
     if not tts_engine or not tts_engine.loaded:
         raise HTTPException(503, "模型未加载")
     if not text.strip():
         raise HTTPException(400, "文本为空")
     
-    logger.info(f"[TTS] '{text[:30]}' voice={voice_id or 'default'}")
+    session = _resolve_session_id(session_id, request)
+    mode = _normalize_interrupt_mode(interrupt_mode)
+    logger.info(f"[TTS] session={session} mode={mode} '{text[:30]}' voice={voice_id or 'default'}")
     start_time = time.time()
     
     def gen():
         first = True
-        for chunk in tts_engine.synthesize(text, voice_id=voice_id):
+        for chunk in tts_engine.synthesize(
+            text,
+            voice_id=voice_id,
+            session_id=session,
+            interrupt_mode=mode,
+        ):
             if first:
                 logger.info(f"[TTS] ⏱️ 首包延迟: {time.time() - start_time:.3f}s")
                 first = False
@@ -429,7 +668,7 @@ async def interrupt():
 
 def main():
     global tts_engine
-    _setup_logging("tts", "tts.log")
+    # 日志已在模块加载时配置（见文件末尾），保证 python tts_server.py 与 uvicorn tts_server:app 均有 log 文件
 
     # 默认路径
     default_model_dir = os.path.join(SCRIPT_DIR, "model", "Fun-CosyVoice3-0.5B")
@@ -477,6 +716,9 @@ def main():
     # 启动服务
     uvicorn.run(app, host=args.host, port=args.port)
 
+
+# 模块加载时即配置日志（python tts_server.py 或 uvicorn tts_server:app 都会执行），日志文件在项目根 log/tts/tts.log
+_setup_logging()
 
 if __name__ == "__main__":
     main()

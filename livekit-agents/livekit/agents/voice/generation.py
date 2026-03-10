@@ -25,6 +25,7 @@ from ..llm import (
 )
 from ..log import logger
 from ..telemetry import trace_types, tracer
+from .playback_boundary_log import default_logger as playback_boundary_log
 from ..types import USERDATA_TIMED_TRANSCRIPT, FlushSentinel, NotGivenOr
 from ..utils import aio, is_given
 from ..utils.aio import itertools
@@ -365,6 +366,7 @@ async def _audio_forwarding_task(
 ) -> None:
     resampler: rtc.AudioResampler | None = None
     frame_count = 0
+    submit_index = 0
     try:
         audio_output.resume()
         async for frame in tts_output:
@@ -387,8 +389,12 @@ async def _audio_forwarding_task(
 
             if resampler:
                 for f in resampler.push(frame):
+                    submit_index += 1
+                    playback_boundary_log.log_pipeline_to_output(frame_index=submit_index)
                     await audio_output.capture_frame(f)
             else:
+                submit_index += 1
+                playback_boundary_log.log_pipeline_to_output(frame_index=submit_index)
                 await audio_output.capture_frame(frame)
 
             # set the first frame future if not already set
@@ -398,6 +404,8 @@ async def _audio_forwarding_task(
 
         if resampler:
             for frame in resampler.flush():
+                submit_index += 1
+                playback_boundary_log.log_pipeline_to_output(frame_index=submit_index)
                 await audio_output.capture_frame(frame)
 
     finally:

@@ -8,7 +8,6 @@ import sys
 import time
 import json
 import websockets
-import numpy as np
 import asyncio
 import logging
 from typing import Optional
@@ -36,14 +35,6 @@ os.makedirs(_log_dir, exist_ok=True)
 
 # 流水线日志：控制台 + log/agent/pipeline.log，带时间戳
 init_pipeline_logging(_log_dir, "pipeline.log")
-
-# 播放边界打点：log/agent/playback_boundary.log，用于分析残留播放位置（agent 侧）
-try:
-    from livekit.agents.voice.playback_boundary_log import init_playback_boundary_file_logging
-    init_playback_boundary_file_logging(_log_dir, "playback_boundary.log")
-    logging.getLogger("playback_boundary").info("PlaybackBoundary 日志将写入: %s", os.path.join(_log_dir, "playback_boundary.log"))
-except Exception as e:
-    logging.warning("PlaybackBoundary 文件日志未初始化: %s", e)
 
 # 抑制所有 livekit/agents 的 INFO，只保留本进程的 pipeline 流水线日志，避免刷屏
 for _name in (
@@ -76,12 +67,8 @@ from livekit.agents.voice.events import (
     UserInputTranscribedEvent,
     ConversationItemAddedEvent,
     MetricsCollectedEvent,
-    E2ETimingEvent,
 )
 from livekit.agents.metrics import LLMMetrics, STTMetrics, TTSMetrics
-
-
-
 
 
 from livekit.plugins import silero, openai
@@ -158,8 +145,6 @@ async def _run_always_on_kws_listener(
             await asyncio.gather(send_loop(), recv_loop())
     except Exception as e:
         logging.warning("[KWS always-on] connection/listener ended: %s", e)
-
-# logger = logging.getLogger("stt-llm-agent")
 
 
 # ========== STT 实例 ==========
@@ -240,20 +225,6 @@ def _on_user_input_transcribed(ev: UserInputTranscribedEvent) -> None:
         log_stt(ev.transcript)
 
 
-def _on_e2e_timing(ev: E2ETimingEvent) -> None:
-    """LLM 流式首 chunk 时刻：记录并打 [耗时-LLM首包] = 首chunk时刻 - STT结果时刻。"""
-    global _last_llm_ttft, _llm_ttft_logged
-    if ev.llm_first_token is None or _llm_ttft_logged:
-        return
-    _llm_ttft_logged = True
-    record_llm_first_chunk_time(ev.llm_first_token)
-    stt_at = get_e2e_stt_result_at()
-    if stt_at is not None:
-        duration = max(0.0, ev.llm_first_token - stt_at)
-        _last_llm_ttft = duration
-        log_module("LLM首包", duration)
-
-
 def _on_conversation_item_added(ev: ConversationItemAddedEvent) -> None:
     item = ev.item
     if getattr(item, "role", None) == "assistant" and hasattr(item, "text_content"):
@@ -274,6 +245,10 @@ def _on_metrics_collected(ev: MetricsCollectedEvent) -> None:
             _llm_ttft_logged = True
             record_llm_first_chunk_time(time.time())
             log_module("LLM首包", m.ttft)
+            # pip 无 E2ETimingEvent，用墙钟补算「STT 结果 → 收到 LLM 首包」间隔
+            stt_at = get_e2e_stt_result_at()
+            if stt_at is not None:
+                log_module("STT结果 → LLM首包(墙钟)", max(0.0, time.time() - stt_at))
     elif isinstance(m, TTSMetrics):
         log_tts_request_to_first_frame()  # 请求时刻→首帧时刻 的墙钟耗时
         log_tts("", duration_s=m.ttfb, chars=m.characters_count)
@@ -310,26 +285,21 @@ async def entrypoint(ctx: JobContext):
     # 2. 等待用户 (这一步其实 session.start 内部也会做，但写在这里更稳妥)
     participant = await ctx.wait_for_participant()
     participant_identity = participant.identity  # 供常驻 KWS 的 track_subscribed 回调使用
-    attributes = participant.attributes or {}
-    # 人脸唤醒 (wake_source=face) 时不走 KWS，直接播「我在呢」并进入 STT/TTS
-    kws_enabled = attributes.get("wake_source") != "face"
 
-    # 3. 初始化 Session
+    # 3. 初始化 Session（pip 版无 kws_enabled，唤醒与打断由下方常驻 KWS 负责）
     session = AgentSession(
         stt=my_stt,
         llm=my_llm,
         tts=my_tts,
         vad=ctx.proc.userdata["vad"],
         # allow_interruptions=False：agent 播放时用户说话不送 STT，防止误触发 LLM
-        # 唤醒词打断通过 always-on KWS + force=True interrupt 实现，不受此限制
+        # 唤醒词打断通过 always-on KWS + force=True interrupt 实现
         allow_interruptions=False,
-        kws_enabled=kws_enabled,
     )
 
     session.on("user_input_transcribed", _on_user_input_transcribed)
     session.on("conversation_item_added", _on_conversation_item_added)
     session.on("metrics_collected", _on_metrics_collected)
-    session.on("e2e_timing", _on_e2e_timing)
 
     # @session.on("user_state_changed")
     # def on_user_state_changed(ev: UserStateChangedEvent):
@@ -367,10 +337,6 @@ async def entrypoint(ctx: JobContext):
             audio_input=AudioInputOptions(sample_rate=16000, frame_size_ms=150),
         ),
     )
-
-
-
-
 
 
 if __name__ == "__main__":

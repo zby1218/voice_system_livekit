@@ -10,6 +10,7 @@ from livekit import rtc, api
 import os
 import queue
 import threading
+import time
 
 # ========== 配置 ==========
 # 麦克风采样率 (发送给 Agent)
@@ -23,7 +24,7 @@ PLAYBACK_SAMPLE_RATE = 48000
 PLAYBACK_CHANNELS = 1
 PLAYBACK_BLOCK_SIZE = 4800   # 100ms @ 48kHz
 
-ROOM_NAME = "test_room"
+ROOM_NAME = f"test_room_{int(time.time())}"
 
 LIVEKIT_URL = "ws://127.0.0.1:7880"
 # LIVEKIT_URL = "ws://43.143.225.193:7880"

@@ -827,7 +827,7 @@ class AgentActivity(RecognitionHooks):
                             if msg_type == "wake_detected":
                                 if response.get("success"):
                                     self.is_awake = True
-                                    self.say("我在呢", allow_interruptions=False)
+                                    # self.say("我在呢", allow_interruptions=False)
 
                                     # 转移状态
                                     self._session._update_user_state("listening")

@@ -97,13 +97,15 @@ class KWSWebSocketServer:
                     "seg_dict": self.lexicon_list
                 },
                 frontend_conf={"cmvn_file": self.cmvn_file},
-                device="cuda:0" if torch.cuda.is_available() else "cpu",
+                # device="cuda:0" if torch.cuda.is_available() else "cpu",
+                device="cpu",
                 keywords=self.keywords,
                 disable_update=True,
                 disable_log=True,
                 log_level="ERROR"
             )
-            device = "GPU" if torch.cuda.is_available() else "CPU"
+            # device = "GPU" if torch.cuda.is_available() else "CPU"
+            device = "CPU"
             logger.info(f"✅ 唤醒模型加载成功 (设备: {device}, 阈值: {self.threshold}, 唤醒词: {self.keywords})")
         except Exception as e:
             logger.error(f"❌ 模型加载失败: {e}")
@@ -330,7 +332,7 @@ def main():
                         help="模型路径")
     parser.add_argument("--keywords", type=str, default="小莫小莫,你好小莫", 
                         help="唤醒词,用逗号分隔")
-    parser.add_argument("--threshold", type=float, default=0.1, 
+    parser.add_argument("--threshold", type=float, default=0.05, 
                         help="唤醒阈值 (0.0-1.0)")
     parser.add_argument("--host", type=str, default="0.0.0.0", 
                         help="服务器地址")

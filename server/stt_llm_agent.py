@@ -6,6 +6,8 @@ STT + LLM Agent (使用 AgentServer) - 语音识别后调用 LLM 并打印结果
 import os
 import sys
 import time
+import json
+import websockets
 import numpy as np
 import asyncio
 import logging
@@ -52,6 +54,7 @@ for _name in (
     "my_stt",
     "ASRServer",
     "custom_tts",
+    "playback_boundary",
 ):
     logging.getLogger(_name).setLevel(logging.WARNING)
 
@@ -95,6 +98,66 @@ PROMPT_WAV_PATH = os.path.join(current_dir, "..", "tts", "assets", "zero_shot_pr
 os.environ.setdefault("LIVEKIT_URL", "ws://localhost:7880")
 os.environ.setdefault("LIVEKIT_API_KEY", "devkey")
 os.environ.setdefault("LIVEKIT_API_SECRET", "secret")
+
+KWS_WS_URI = "ws://localhost:8765"
+SAMPLE_RATE = 16000
+FRAME_SIZE_MS = 150
+
+async def _run_always_on_kws_listener(
+    room: rtc.Room,
+    participant_identity: str,
+    track: rtc.RemoteTrack,
+    session: AgentSession,
+) -> None:
+    """从同一路麦克风轨道创建独立 AudioStream，持续送 KWS；检测到唤醒词后打断当前播放并说「我在听」。"""
+    stream = rtc.AudioStream.from_track(
+        track=track,
+        sample_rate=SAMPLE_RATE,
+        num_channels=1,
+        frame_size_ms=FRAME_SIZE_MS,
+    )
+    try:
+        async with websockets.connect(KWS_WS_URI) as ws:
+            async def send_loop():
+                try:
+                    async for event in stream:
+                        await ws.send(event.frame.data.tobytes())
+                except Exception as e:
+                    logging.warning("[KWS always-on] send_loop ended: %s", e)
+
+            async def recv_loop():
+                try:
+                    while True:
+                        msg = await ws.recv()
+                        data = json.loads(msg)
+                        if data.get("type") == "wake_detected" and data.get("success"):
+                            logging.info("[KWS always-on] 唤醒词检测到，执行打断")
+                            activity = getattr(session, "_activity", None)
+                            if activity is None:
+                                logging.warning("[KWS always-on] session._activity 未就绪，跳过")
+                                continue
+
+                            # ① 无论打断是否成功，都必须清空 STT 状态
+                            #    防止唤醒词这一句被 STT 识别后提交给 LLM 产生错位回答
+                            try:
+                                session.clear_user_turn()
+                            except Exception as e:
+                                logging.warning("[KWS always-on] clear_user_turn 失败: %s", e)
+
+                            # ② 强制打断当前语音并播「我在听」
+                            #    force=True：allow_interruptions=False 时也能打断
+                            #    唤醒词场景下，用户主动唤醒优先级最高，应无条件打断
+                            try:
+                                activity.interrupt(force=True)
+                                session.say("我在听", allow_interruptions=False)
+                            except Exception as e:
+                                logging.warning("[KWS always-on] 打断失败: %s", e)
+                except Exception as e:
+                    logging.warning("[KWS always-on] recv_loop ended: %s", e)
+
+            await asyncio.gather(send_loop(), recv_loop())
+    except Exception as e:
+        logging.warning("[KWS always-on] connection/listener ended: %s", e)
 
 # logger = logging.getLogger("stt-llm-agent")
 
@@ -246,6 +309,7 @@ async def entrypoint(ctx: JobContext):
     
     # 2. 等待用户 (这一步其实 session.start 内部也会做，但写在这里更稳妥)
     participant = await ctx.wait_for_participant()
+    participant_identity = participant.identity  # 供常驻 KWS 的 track_subscribed 回调使用
     attributes = participant.attributes or {}
     # 人脸唤醒 (wake_source=face) 时不走 KWS，直接播「我在呢」并进入 STT/TTS
     kws_enabled = attributes.get("wake_source") != "face"
@@ -256,7 +320,9 @@ async def entrypoint(ctx: JobContext):
         llm=my_llm,
         tts=my_tts,
         vad=ctx.proc.userdata["vad"],
-        allow_interruptions=True,
+        # allow_interruptions=False：agent 播放时用户说话不送 STT，防止误触发 LLM
+        # 唤醒词打断通过 always-on KWS + force=True interrupt 实现，不受此限制
+        allow_interruptions=False,
         kws_enabled=kws_enabled,
     )
 
@@ -273,8 +339,26 @@ async def entrypoint(ctx: JobContext):
     #         # asyncio.create_task(
     #         #     session.say("我先休息了", allow_interruptions=True)
     #         # )
-
-
+    _kws_listener_task: asyncio.Task | None = None
+    @ctx.room.on("track_subscribed")
+    def _on_track_subscribed(
+        track: rtc.Track,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
+    ) -> None:
+        nonlocal _kws_listener_task
+        if participant.identity != participant_identity:
+            return
+        if publication.source != rtc.TrackSource.SOURCE_MICROPHONE:
+            return
+        if not publication.track:
+            return
+        # 只起一个常驻 KWS 任务，避免重复
+        if _kws_listener_task is not None and not _kws_listener_task.done():
+            return
+        _kws_listener_task = asyncio.create_task(
+            _run_always_on_kws_listener(ctx.room, participant_identity, publication.track, session)
+        )
         
     await session.start(
         agent=MyAgent(),
@@ -284,9 +368,6 @@ async def entrypoint(ctx: JobContext):
         ),
     )
 
-
-
-    
 
 
 

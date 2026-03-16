@@ -8,9 +8,50 @@ import numpy as np
 import torch
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Any
+
 from funasr import AutoModel
 import websockets
 from websockets.server import serve
+
+
+# ---------------------------------------------------------------------------
+# 配置与常量
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class KWSConfig:
+    """KWS 服务配置：路径、音频参数、网络与推理常量。"""
+    model_dir: str
+    keywords: str = "小莫小莫,你好小莫"
+    threshold: float = 0.4
+    host: str = "0.0.0.0"
+    port: int = 8765
+    # 音频
+    sample_rate: int = 16000
+    channels: int = 1
+    chunk_samples: int = 2400  # 150ms @ 16kHz
+    min_samples_for_inference: int = 8000   # 500ms
+    max_samples_in_buffer: int = 32000       # 2s
+    # 日志统计间隔（秒）
+    stats_interval_sec: float = 10.0
+
+    @property
+    def weight_path(self) -> str:
+        return os.path.join(self.model_dir, "model_weight", "model.pt.avg10")
+
+    @property
+    def token_list(self) -> str:
+        return os.path.join(self.model_dir, "tokens_2599.txt")
+
+    @property
+    def lexicon_list(self) -> str:
+        return os.path.join(self.model_dir, "lexicon.txt")
+
+    @property
+    def cmvn_file(self) -> str:
+        return os.path.join(self.model_dir, "am.mvn.dim80_l2r2")
 
 
 def _setup_logging(log_subdir: str, log_filename: str) -> None:
@@ -42,87 +83,91 @@ def _setup_logging(log_subdir: str, log_filename: str) -> None:
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# 协议消息构建（便于单测与复用）
+# ---------------------------------------------------------------------------
+
+def _make_welcome_message(config: KWSConfig) -> dict[str, Any]:
+    """构建连接成功时的欢迎消息。"""
+    return {
+        "type": "connected",
+        "message": "已连接到唤醒词检测服务",
+        "keywords": config.keywords,
+        "threshold": config.threshold,
+        "audio_format": {
+            "sample_rate": config.sample_rate,
+            "channels": config.channels,
+            "chunk_size": config.chunk_samples,
+        },
+    }
+
+
+def _make_wake_detected_response(keyword: str, score: float) -> dict[str, Any]:
+    """构建唤醒检测成功的响应。"""
+    return {
+        "type": "wake_detected",
+        "success": True,
+        "keyword": keyword,
+        "score": float(score),
+        "timestamp": asyncio.get_running_loop().time(),
+    }
+
+
 class KWSWebSocketServer:
-    """基于 WebSocket 的唤醒词检测服务"""
-    
-    def __init__(self, 
-                 model_dir='./model',
-                 keywords="小莫小莫,你好小莫",
-                 threshold=0.4,
-                 host='0.0.0.0',
-                 port=8765):
-        """
-        初始化 WebSocket 唤醒词服务
-        
-        :param model_dir: 模型目录
-        :param keywords: 唤醒词列表
-        :param threshold: 唤醒置信度阈值 (0.0 ~ 1.0)
-        :param host: WebSocket 服务器地址
-        :param port: WebSocket 服务器端口
-        """
-        self.model_dir = model_dir
-        self.keywords = keywords
-        self.threshold = threshold
-        self.host = host
-        self.port = port
-        
-        # 诊断模式
-        self.diagnostic_mode = False
-        self.diagnostic_duration = 5.0  # 录制时长 (秒)
-        self._diagnostics = None
-        
-        # 路径配置
-        self.weight_path = os.path.join(model_dir, 'model_weight/model.pt.avg10')
-        self.token_list = os.path.join(model_dir, 'tokens_2599.txt')
-        self.lexicon_list = os.path.join(model_dir, 'lexicon.txt')
-        self.cmvn_file = os.path.join(model_dir, 'am.mvn.dim80_l2r2')
-        
-        # 音频参数
-        self.CHUNK = 2400  # 150ms per chunk at 16kHz
-        self.RATE = 16000
-        self.CHANNELS = 1
-        # 推理并发控制：KWS 模型非线程安全，用单线程 executor + asyncio Lock 串行化调用
+    """基于 WebSocket 的唤醒词检测服务。职责：配置、模型加载、连接处理、推理调度。"""
+
+    def __init__(
+        self,
+        model_dir: str = "./model",
+        keywords: str = "小莫小莫,你好小莫",
+        threshold: float = 0.4,
+        host: str = "0.0.0.0",
+        port: int = 8765,
+        config: KWSConfig | None = None,
+    ):
+        self._config = config or KWSConfig(model_dir=model_dir, keywords=keywords, threshold=threshold, host=host, port=port)
         self._executor = ThreadPoolExecutor(max_workers=1)
-        self._infer_lock: asyncio.Lock | None = None  # 在事件循环内创建
-        # 加载模型
+        self._infer_lock: asyncio.Lock | None = None
+        self._model: Any = None
         self._load_model()
-        
-    def _load_model(self):
-        """加载唤醒词模型"""
-        logger.info(f"正在加载唤醒模型...")
-        logging.getLogger('funasr').setLevel(logging.ERROR)
-        logger.info(f"模型目录: {self.model_dir}")
+
+    @property
+    def config(self) -> KWSConfig:
+        return self._config
+
+    def _load_model(self) -> None:
+        """加载唤醒词模型（仅读配置与模型文件，无副作用）。"""
+        cfg = self._config
+        logger.info("正在加载唤醒模型...")
+        logging.getLogger("funasr").setLevel(logging.ERROR)
+        logger.info("模型目录: %s", cfg.model_dir)
         try:
-            self.model = AutoModel(
-                model=self.model_dir,
-                init_param=self.weight_path,
-                tokenizer_conf={
-                    "token_list": self.token_list, 
-                    "seg_dict": self.lexicon_list
-                },
-                frontend_conf={"cmvn_file": self.cmvn_file},
-                # device="cuda:0" if torch.cuda.is_available() else "cpu",
+            self._model = AutoModel(
+                model=cfg.model_dir,
+                init_param=cfg.weight_path,
+                tokenizer_conf={"token_list": cfg.token_list, "seg_dict": cfg.lexicon_list},
+                frontend_conf={"cmvn_file": cfg.cmvn_file},
                 device="cpu",
-                keywords=self.keywords,
+                keywords=cfg.keywords,
                 disable_update=True,
                 disable_log=True,
-                log_level="ERROR"
+                log_level="ERROR",
             )
-            # device = "GPU" if torch.cuda.is_available() else "CPU"
-            device = "CPU"
-            logger.info(f"✅ 唤醒模型加载成功 (设备: {device}, 阈值: {self.threshold}, 唤醒词: {self.keywords})")
+            logger.info("✅ 唤醒模型加载成功 (设备: CPU, 阈值: %s, 唤醒词: %s)", cfg.threshold, cfg.keywords)
         except Exception as e:
-            logger.error(f"❌ 模型加载失败: {e}")
-            raise e
-    
-    def _detect_keyword(self, audio_data, client_logger: logging.Logger | None = None):
+            logger.error("❌ 模型加载失败: %s", e)
+            raise
+
+    def _detect_keyword(self, audio_data: np.ndarray, client_logger: logging.Logger | None = None):
         """
-        检测音频中是否包含唤醒词
+        检测音频中是否包含唤醒词。
 
         :param audio_data: numpy array 格式的音频数据
         :param client_logger: per-client logger，传入后日志自动携带客户端标识
         :return: (is_detected: bool, score: float, keyword: str, infer_time: float)
         """
+        cfg = self._config
         log = client_logger or logger
         try:
             if audio_data.dtype != np.float32:
@@ -130,22 +175,26 @@ class KWSWebSocketServer:
 
             infer_start = time.time()
             with torch.no_grad():
-                res = self.model.generate(
+                res = self._model.generate(
                     input=audio_data,
                     cache={},
-                    disable_pbar=True
+                    disable_pbar=True,
                 )
                 infer_time = (time.time() - infer_start) * 1000
 
             if res and len(res) > 0:
-                text_output = res[0].get('text', '')
+                text_output = res[0].get("text", "")
                 if "detected" in text_output:
                     try:
                         score = float(text_output.split()[-1])
-                        log.info("[TIMING] 检测到唤醒词: %s, 置信度: %.3f, 推理耗时: %.1fms",
-                                 self.keywords, score, infer_time)
-                        if score > self.threshold:
-                            return True, score, self.keywords, infer_time
+                        log.info(
+                            "[TIMING] 检测到唤醒词: %s, 置信度: %.3f, 推理耗时: %.1fms",
+                            cfg.keywords,
+                            score,
+                            infer_time,
+                        )
+                        if score > cfg.threshold:
+                            return True, score, cfg.keywords, infer_time
                     except ValueError:
                         pass
 
@@ -154,130 +203,135 @@ class KWSWebSocketServer:
         except Exception as e:
             log.error("检测过程出错: %s", e)
             return False, 0.0, "", 0.0
-    
-    async def handle_client(self, websocket, path):
-        """
-        处理单个 WebSocket 客户端连接
 
-        :param websocket: WebSocket 连接对象
-        :param path: 请求路径
+    async def _handle_audio_frame(
+        self,
+        websocket: Any,
+        chunk: bytes,
+        audio_buffer: bytearray,
+        first_audio_time: float | None,
+        receive_count: int,
+        last_log_time: float,
+        clog: logging.Logger,
+    ) -> tuple[float | None, int, float, bool]:
         """
+        处理一帧二进制音频：追加、截断、满足长度则推理；若检测到唤醒则发响应。
+        返回 (新 first_audio_time, 新 receive_count, 新 last_log_time, 是否已清空缓冲需重置 first_audio_time)。
+        """
+        cfg = self._config
+        recv_time = time.time()
+        receive_count += 1
+        if first_audio_time is None:
+            first_audio_time = recv_time
+            clog.info("[TIMING] 首次接收音频 @ %.3f", recv_time)
+
+        if recv_time - last_log_time >= cfg.stats_interval_sec:
+            clog.info(
+                "[TIMING] 音频接收统计: 过去%.0fs 收到 %d 个数据包, 每包 %d 字节",
+                cfg.stats_interval_sec,
+                receive_count,
+                len(chunk),
+            )
+            receive_count = 0
+            last_log_time = recv_time
+
+        audio_buffer.extend(chunk)
+        max_bytes = cfg.max_samples_in_buffer * 2
+        if len(audio_buffer) > max_bytes:
+            del audio_buffer[: len(audio_buffer) - max_bytes]
+
+        current_samples = len(audio_buffer) // 2
+        buffer_duration_ms = current_samples / cfg.sample_rate * 1000
+        if current_samples < cfg.min_samples_for_inference:
+            return first_audio_time, receive_count, last_log_time, False
+
+        data_np = np.frombuffer(bytes(audio_buffer), dtype=np.int16)
+        data_input = (data_np.astype(np.float32) / 32768.0).copy()
+
+        loop = asyncio.get_running_loop()
+        async with self._infer_lock:  # type: ignore[union-attr]
+            is_detected, score, keyword, infer_time = await loop.run_in_executor(
+                self._executor,
+                lambda: self._detect_keyword(data_input, clog),
+            )
+
+        if is_detected:
+            total_latency = (time.time() - first_audio_time) * 1000 if first_audio_time else 0
+            clog.info("[TIMING] ========== 唤醒成功 ==========")
+            clog.info("[TIMING] 置信度: %.3f", score)
+            clog.info("[TIMING] 缓冲区: %.0fms", buffer_duration_ms)
+            clog.info("[TIMING] 推理耗时: %.1fms", infer_time)
+            clog.info("[TIMING] 从首次接收到唤醒: %.0fms", total_latency)
+            clog.info("[TIMING] ================================")
+            send_start = time.time()
+            await websocket.send(json.dumps(_make_wake_detected_response(keyword, score)))
+            clog.info("[TIMING] 发送响应耗时: %.1fms", (time.time() - send_start) * 1000)
+            audio_buffer.clear()
+            return None, receive_count, last_log_time, True
+
+        return first_audio_time, receive_count, last_log_time, False
+
+    async def _handle_text_command(
+        self,
+        websocket: Any,
+        message: str,
+        audio_buffer: bytearray,
+        clog: logging.Logger,
+    ) -> bool:
+        """处理文本命令（ping/reset/close）。返回是否应关闭连接。"""
+        try:
+            cmd = json.loads(message)
+            cmd_type = cmd.get("type")
+            if cmd_type == "ping":
+                await websocket.send(json.dumps({"type": "pong"}))
+                return False
+            if cmd_type == "reset":
+                audio_buffer.clear()
+                await websocket.send(json.dumps({"type": "reset_ack", "message": "缓冲区已清空"}))
+                return False
+            if cmd_type == "close":
+                clog.info("📴 客户端请求关闭连接")
+                return True
+            clog.warning("未知命令类型: %s", cmd_type)
+            return False
+        except json.JSONDecodeError:
+            clog.warning("收到无效的 JSON 数据: %s", message[:100])
+            return False
+
+    async def handle_client(self, websocket: Any, path: str) -> None:
+        """处理单个 WebSocket 客户端连接：欢迎消息、按类型分发二进制/文本消息。"""
         client_id = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
         clog = logging.getLogger(f"KWSServer.{client_id}")
+        cfg = self._config
 
-        # 滑动窗口参数 (基于字节流，更健壮)
-        min_samples = self.RATE // 2       # 至少 500ms 才开始推理
-        max_samples = self.RATE * 2        # 最多保留 2s
-        max_bytes   = max_samples * 2      # int16 = 2 bytes
+        audio_buffer = bytearray()
+        receive_count = 0
+        last_log_time = time.time()
+        first_audio_time: float | None = None
 
-        audio_buffer = b''
-
-        clog.info("🔌 新客户端连接 (当前阈值: %.2f, 唤醒词: %s)", self.threshold, self.keywords)
+        clog.info("🔌 新客户端连接 (当前阈值: %.2f, 唤醒词: %s)", cfg.threshold, cfg.keywords)
 
         try:
-            welcome_msg = {
-                "type": "connected",
-                "message": "已连接到唤醒词检测服务",
-                "keywords": self.keywords,
-                "threshold": self.threshold,
-                "audio_format": {
-                    "sample_rate": self.RATE,
-                    "channels": self.CHANNELS,
-                    "chunk_size": self.CHUNK
-                }
-            }
-            await websocket.send(json.dumps(welcome_msg))
-
-            receive_count = 0
-            last_log_time = time.time()
-            first_audio_time = None
+            await websocket.send(json.dumps(_make_welcome_message(cfg)))
 
             async for message in websocket:
                 try:
                     if isinstance(message, bytes):
-                        recv_time = time.time()
-                        receive_count += 1
-
-                        if first_audio_time is None:
-                            first_audio_time = recv_time
-                            clog.info("[TIMING] 首次接收音频 @ %.3f", recv_time)
-
-                        if recv_time - last_log_time >= 10.0:
-                            clog.info("[TIMING] 音频接收统计: 过去10秒收到 %d 个数据包, 每包 %d 字节",
-                                      receive_count, len(message))
-                            receive_count = 0
-                            last_log_time = recv_time
-
-                        audio_buffer += message
-                        if len(audio_buffer) > max_bytes:
-                            audio_buffer = audio_buffer[-max_bytes:]
-
-                        current_samples = len(audio_buffer) // 2
-                        buffer_duration_ms = current_samples / self.RATE * 1000
-
-                        if current_samples < min_samples:
-                            continue
-
-                        preprocess_start = time.time()
-                        data_np = np.frombuffer(audio_buffer, dtype=np.int16)
-                        data_input = data_np.astype(np.float32) / 32768.0
-                        preprocess_time = (time.time() - preprocess_start) * 1000
-
-                        # 推理（executor 中运行，避免阻塞事件循环；传入 clog 使推理日志同样带 client_id）
-                        detect_start = time.time()
-                        loop = asyncio.get_running_loop()
-                        async with self._infer_lock:  # type: ignore[union-attr]
-                            is_detected, score, keyword, infer_time = await loop.run_in_executor(
-                                self._executor,
-                                lambda d=data_input: self._detect_keyword(d, clog),
-                            )
-                        total_detect_time = (time.time() - detect_start) * 1000
-
-                        if is_detected:
-                            clog.info("[TIMING] ========== 唤醒成功 ==========")
-                            clog.info("[TIMING] 置信度: %.3f", score)
-                            clog.info("[TIMING] 缓冲区: %.0fms", buffer_duration_ms)
-                            clog.info("[TIMING] 预处理: %.1fms", preprocess_time)
-                            clog.info("[TIMING] 推理耗时: %.1fms", infer_time)
-                            clog.info("[TIMING] 检测总耗时: %.1fms", total_detect_time)
-                            clog.info("[TIMING] ================================")
-
-                            send_start = time.time()
-                            response = {
-                                "type": "wake_detected",
-                                "success": True,
-                                "keyword": keyword,
-                                "score": float(score),
-                                "timestamp": asyncio.get_running_loop().time()
-                            }
-                            await websocket.send(json.dumps(response))
-                            clog.info("[TIMING] 发送响应耗时: %.1fms", (time.time() - send_start) * 1000)
-
-                            audio_buffer = b''
+                        first_audio_time, receive_count, last_log_time, cleared = await self._handle_audio_frame(
+                            websocket,
+                            message,
+                            audio_buffer,
+                            first_audio_time,
+                            receive_count,
+                            last_log_time,
+                            clog,
+                        )
+                        if cleared:
                             first_audio_time = None
-
                     elif isinstance(message, str):
-                        try:
-                            cmd = json.loads(message)
-                            cmd_type = cmd.get("type")
-
-                            if cmd_type == "ping":
-                                await websocket.send(json.dumps({"type": "pong"}))
-                            elif cmd_type == "reset":
-                                audio_buffer = b''
-                                await websocket.send(json.dumps({
-                                    "type": "reset_ack",
-                                    "message": "缓冲区已清空"
-                                }))
-                            elif cmd_type == "close":
-                                clog.info("📴 客户端请求关闭连接")
-                                break
-                            else:
-                                clog.warning("未知命令类型: %s", cmd_type)
-
-                        except json.JSONDecodeError:
-                            clog.warning("收到无效的 JSON 数据: %s", message[:100])
-
+                        should_close = await self._handle_text_command(websocket, message, audio_buffer, clog)
+                        if should_close:
+                            break
                 except Exception as e:
                     clog.error("处理消息时出错: %s", e)
                     try:
@@ -291,16 +345,17 @@ class KWSWebSocketServer:
             clog.error("❌ 连接处理异常: %s", e)
         finally:
             clog.info("📴 客户端断开连接")
-    
-    async def start_server(self):
-        """启动 WebSocket 服务器"""
-        self._infer_lock = asyncio.Lock()  # 在事件循环内创建，避免跨循环绑定问题
-        logger.info(f"🚀 启动 WebSocket 唤醒词服务...")
-        logger.info(f"   监听地址: ws://{self.host}:{self.port}")
-        
-        async with serve(self.handle_client, self.host, self.port):
-            logger.info(f"✅ 服务器已启动，等待客户端连接...")
-            await asyncio.Future()  # 永久运行
+
+    async def start_server(self) -> None:
+        """启动 WebSocket 服务器（在事件循环内创建 Lock）。"""
+        self._infer_lock = asyncio.Lock()
+        cfg = self._config
+        logger.info("🚀 启动 WebSocket 唤醒词服务...")
+        logger.info("   监听地址: ws://%s:%s", cfg.host, cfg.port)
+
+        async with serve(self.handle_client, cfg.host, cfg.port):
+            logger.info("✅ 服务器已启动，等待客户端连接...")
+            await asyncio.Future()
 
 
 def main():

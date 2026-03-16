@@ -7,6 +7,7 @@ import argparse
 import numpy as np
 import torch
 import time
+from concurrent.futures import ThreadPoolExecutor
 from funasr import AutoModel
 import websockets
 from websockets.server import serve
@@ -80,6 +81,9 @@ class KWSWebSocketServer:
         self.CHUNK = 2400  # 150ms per chunk at 16kHz
         self.RATE = 16000
         self.CHANNELS = 1
+        # 推理并发控制：KWS 模型非线程安全，用单线程 executor + asyncio Lock 串行化调用
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._infer_lock: asyncio.Lock | None = None  # 在事件循环内创建
         # 加载模型
         self._load_model()
         
@@ -111,69 +115,66 @@ class KWSWebSocketServer:
             logger.error(f"❌ 模型加载失败: {e}")
             raise e
     
-    def _detect_keyword(self, audio_data):
+    def _detect_keyword(self, audio_data, client_logger: logging.Logger | None = None):
         """
         检测音频中是否包含唤醒词
-        
+
         :param audio_data: numpy array 格式的音频数据
+        :param client_logger: per-client logger，传入后日志自动携带客户端标识
         :return: (is_detected: bool, score: float, keyword: str, infer_time: float)
         """
+        log = client_logger or logger
         try:
-            # print(f"检测音频数据: {audio_data.shape}")
-            # 确保音频数据是 float32 格式
             if audio_data.dtype != np.float32:
                 audio_data = audio_data.astype(np.float32)
-            
-            # 推理
+
             infer_start = time.time()
             with torch.no_grad():
                 res = self.model.generate(
-                    input=audio_data, 
-                    cache={}, 
+                    input=audio_data,
+                    cache={},
                     disable_pbar=True
                 )
-                infer_time = (time.time() - infer_start) * 1000  # 转换为毫秒
-            
-            # 解析结果
+                infer_time = (time.time() - infer_start) * 1000
+
             if res and len(res) > 0:
                 text_output = res[0].get('text', '')
                 if "detected" in text_output:
                     try:
-                        # 解析分数: "detected 0.85" -> 0.85
                         score = float(text_output.split()[-1])
-                        logger.info(f"[TIMING] 检测到唤醒词: {self.keywords}, 置信度: {score}, 推理耗时: {infer_time:.1f}ms")
+                        log.info("[TIMING] 检测到唤醒词: %s, 置信度: %.3f, 推理耗时: %.1fms",
+                                 self.keywords, score, infer_time)
                         if score > self.threshold:
                             return True, score, self.keywords, infer_time
                     except ValueError:
                         pass
-            
+
             return False, 0.0, "", infer_time
-            
+
         except Exception as e:
-            logger.error(f"检测过程出错: {e}")
+            log.error("检测过程出错: %s", e)
             return False, 0.0, "", 0.0
     
     async def handle_client(self, websocket, path):
         """
         处理单个 WebSocket 客户端连接
-        
+
         :param websocket: WebSocket 连接对象
         :param path: 请求路径
         """
         client_id = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
-        logger.info(f"🔌 新客户端连接: {client_id}")
-        
+        clog = logging.getLogger(f"KWSServer.{client_id}")
+
         # 滑动窗口参数 (基于字节流，更健壮)
-        self.RATE = 16000
-        # 16kHz 采样率: 16000 samples = 1 秒
-        self.MIN_SAMPLES_FOR_INFERENCE = 16000 // 2  # 至少 500ms 才开始推理
-        self.MAX_SAMPLES_IN_BUFFER = 16000 * 2       # 最多保留 2s
-        
+        min_samples = self.RATE // 2       # 至少 500ms 才开始推理
+        max_samples = self.RATE * 2        # 最多保留 2s
+        max_bytes   = max_samples * 2      # int16 = 2 bytes
+
         audio_buffer = b''
-        
-        
+
+        clog.info("🔌 新客户端连接 (当前阈值: %.2f, 唤醒词: %s)", self.threshold, self.keywords)
+
         try:
-            # 发送欢迎消息
             welcome_msg = {
                 "type": "connected",
                 "message": "已连接到唤醒词检测服务",
@@ -186,99 +187,80 @@ class KWSWebSocketServer:
                 }
             }
             await websocket.send(json.dumps(welcome_msg))
-            
-            # 持续接收音频数据
+
             receive_count = 0
             last_log_time = time.time()
-            first_audio_time = None  # 记录首次接收到音频的时间
-            
+            first_audio_time = None
+
             async for message in websocket:
                 try:
-                    # 接收二进制音频数据
                     if isinstance(message, bytes):
                         recv_time = time.time()
                         receive_count += 1
-                        
-                        # 记录首次音频时间（用于计算总延迟）
+
                         if first_audio_time is None:
                             first_audio_time = recv_time
-                            logger.info(f"[TIMING] 首次接收音频 @ {recv_time:.3f}")
-                        
-                        # 每5秒打印一次接收统计
-                        if recv_time - last_log_time >= 5.0:
-                            logger.info(f"[TIMING] 音频接收统计: 过去5秒收到 {receive_count} 个数据包, 每包 {len(message)} 字节")
+                            clog.info("[TIMING] 首次接收音频 @ %.3f", recv_time)
+
+                        if recv_time - last_log_time >= 10.0:
+                            clog.info("[TIMING] 音频接收统计: 过去10秒收到 %d 个数据包, 每包 %d 字节",
+                                      receive_count, len(message))
                             receive_count = 0
                             last_log_time = recv_time
-                        
-                        
-                        # 添加到缓冲区
+
                         audio_buffer += message
-                        buffer_before_trim = len(audio_buffer)
-                        
-                        # 限制缓冲区最大长度（保留最新的数据）
-                        max_bytes = self.MAX_SAMPLES_IN_BUFFER * 2  # int16 = 2 bytes
                         if len(audio_buffer) > max_bytes:
                             audio_buffer = audio_buffer[-max_bytes:]
-                            # print(f"[TIMING] 缓冲区裁剪: {buffer_before_trim} -> {len(audio_buffer)} 字节")
-                        
-                        # 检查是否积累足够数据
+
                         current_samples = len(audio_buffer) // 2
                         buffer_duration_ms = current_samples / self.RATE * 1000
-                        
-                        if current_samples < self.MIN_SAMPLES_FOR_INFERENCE:
-                            # print(f"[TIMING] 缓冲区不足: {buffer_duration_ms:.0f}ms < {self.MIN_SAMPLES_FOR_INFERENCE / self.RATE * 1000:.0f}ms")
-                            continue
-                        
-                        # 全部做推理
-                        preprocess_start = time.time()
-                        
-                        data_np = np.frombuffer(audio_buffer, dtype=np.int16)
-                        
-                        data_input = data_np.astype(np.float32) / 32768.0
-                        # print(f"\n\ndata_input: {data_input.shape}, data_input: {data_input}\n\n")
 
+                        if current_samples < min_samples:
+                            continue
+
+                        preprocess_start = time.time()
+                        data_np = np.frombuffer(audio_buffer, dtype=np.int16)
+                        data_input = data_np.astype(np.float32) / 32768.0
                         preprocess_time = (time.time() - preprocess_start) * 1000
-                        
-                        # 执行唤醒词检测
+
+                        # 推理（executor 中运行，避免阻塞事件循环；传入 clog 使推理日志同样带 client_id）
                         detect_start = time.time()
-                        is_detected, score, keyword, infer_time = self._detect_keyword(data_input)
+                        loop = asyncio.get_running_loop()
+                        async with self._infer_lock:  # type: ignore[union-attr]
+                            is_detected, score, keyword, infer_time = await loop.run_in_executor(
+                                self._executor,
+                                lambda d=data_input: self._detect_keyword(d, clog),
+                            )
                         total_detect_time = (time.time() - detect_start) * 1000
-                        
+
                         if is_detected:
-                            total_latency = (time.time() - first_audio_time) * 1000 if first_audio_time else 0
-                            logger.info(f"[TIMING] ========== 唤醒成功 ==========")
-                            logger.info(f"[TIMING] 客户端: {client_id}")
-                            logger.info(f"[TIMING] 置信度: {score:.3f}")
-                            logger.info(f"[TIMING] 缓冲区: {buffer_duration_ms:.0f}ms")
-                            logger.info(f"[TIMING] 预处理: {preprocess_time:.1f}ms")
-                            logger.info(f"[TIMING] 推理耗时: {infer_time:.1f}ms")
-                            logger.info(f"[TIMING] 检测总耗时: {total_detect_time:.1f}ms")
-                            logger.info(f"[TIMING] 从首次接收到唤醒: {total_latency:.0f}ms")
-                            logger.info(f"[TIMING] ================================")
-                            
-                            # 发送检测成功响应
+                            clog.info("[TIMING] ========== 唤醒成功 ==========")
+                            clog.info("[TIMING] 置信度: %.3f", score)
+                            clog.info("[TIMING] 缓冲区: %.0fms", buffer_duration_ms)
+                            clog.info("[TIMING] 预处理: %.1fms", preprocess_time)
+                            clog.info("[TIMING] 推理耗时: %.1fms", infer_time)
+                            clog.info("[TIMING] 检测总耗时: %.1fms", total_detect_time)
+                            clog.info("[TIMING] ================================")
+
                             send_start = time.time()
                             response = {
                                 "type": "wake_detected",
                                 "success": True,
                                 "keyword": keyword,
                                 "score": float(score),
-                                "timestamp": asyncio.get_event_loop().time()
+                                "timestamp": asyncio.get_running_loop().time()
                             }
                             await websocket.send(json.dumps(response))
-                            send_time = (time.time() - send_start) * 1000
-                            logger.info(f"[TIMING] 发送响应耗时: {send_time:.1f}ms")
-                            
-                            # 清空缓冲区 (防止一次说话多次触发)
+                            clog.info("[TIMING] 发送响应耗时: %.1fms", (time.time() - send_start) * 1000)
+
                             audio_buffer = b''
-                            first_audio_time = None  # 重置首次音频时间
-                    
-                    # 接收 JSON 控制命令
+                            first_audio_time = None
+
                     elif isinstance(message, str):
                         try:
                             cmd = json.loads(message)
                             cmd_type = cmd.get("type")
-                            
+
                             if cmd_type == "ping":
                                 await websocket.send(json.dumps({"type": "pong"}))
                             elif cmd_type == "reset":
@@ -288,31 +270,31 @@ class KWSWebSocketServer:
                                     "message": "缓冲区已清空"
                                 }))
                             elif cmd_type == "close":
-                                logger.info(f"📴 [{client_id}] 客户端请求关闭连接")
+                                clog.info("📴 客户端请求关闭连接")
                                 break
                             else:
-                                logger.warning(f"未知命令类型: {cmd_type}")
-                                
+                                clog.warning("未知命令类型: %s", cmd_type)
+
                         except json.JSONDecodeError:
-                            logger.warning(f"收到无效的 JSON 数据: {message[:100]}")
-                
+                            clog.warning("收到无效的 JSON 数据: %s", message[:100])
+
                 except Exception as e:
-                    logger.error(f"处理消息时出错: {e}")
-                    error_msg = {
-                        "type": "error",
-                        "message": str(e)
-                    }
-                    await websocket.send(json.dumps(error_msg))
-        
+                    clog.error("处理消息时出错: %s", e)
+                    try:
+                        await websocket.send(json.dumps({"type": "error", "message": str(e)}))
+                    except Exception:
+                        pass
+
         except websockets.exceptions.ConnectionClosed:
-            logger.info(f"🔌 [{client_id}] 连接已关闭")
+            clog.info("🔌 连接已关闭")
         except Exception as e:
-            logger.error(f"❌ [{client_id}] 连接处理异常: {e}")
+            clog.error("❌ 连接处理异常: %s", e)
         finally:
-            logger.info(f"📴 [{client_id}] 客户端断开连接")
+            clog.info("📴 客户端断开连接")
     
     async def start_server(self):
         """启动 WebSocket 服务器"""
+        self._infer_lock = asyncio.Lock()  # 在事件循环内创建，避免跨循环绑定问题
         logger.info(f"🚀 启动 WebSocket 唤醒词服务...")
         logger.info(f"   监听地址: ws://{self.host}:{self.port}")
         
@@ -332,7 +314,7 @@ def main():
                         help="模型路径")
     parser.add_argument("--keywords", type=str, default="小莫小莫,你好小莫", 
                         help="唤醒词,用逗号分隔")
-    parser.add_argument("--threshold", type=float, default=0.05, 
+    parser.add_argument("--threshold", type=float, default=0.4, 
                         help="唤醒阈值 (0.0-1.0)")
     parser.add_argument("--host", type=str, default="0.0.0.0", 
                         help="服务器地址")

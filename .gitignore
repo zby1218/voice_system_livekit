@@ -4,7 +4,10 @@
 # 主模型权重不提交（FunAudioLLM/Fun-ASR-Nano、Qwen 等）
 stt/model/FunAudioLLM/
 stt/model/Qwen/
-tts/model/
+# TTS：保留目录 tts/model/Fun-CosyVoice3-0.5B/，权重/ONNX 等大文件不入库
+tts/model/Fun-CosyVoice3-0.5B/**
+!tts/model/Fun-CosyVoice3-0.5B/
+!tts/model/Fun-CosyVoice3-0.5B/README.md
 # FunASR 依赖的辅助模型（VAD/标点）通过 Git LFS 跟踪
 # stt/model/models/ 不在此处忽略，整体纳入版本库
 

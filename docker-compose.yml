@@ -1,0 +1,53 @@
+# ==============================================================
+# voice-system docker-compose
+#
+# Build context 必须是 project/ 父目录：
+#   cd /home/zhangchi/project
+#   docker compose -f voice_system_livekit/docker-compose.yml up --build
+#
+# 或者先 build，再 push 到 registry，在目标机 pull 后启动（见 deploy.sh）。
+# ==============================================================
+services:
+  voice-system:
+    build:
+      context: ..               # project/ 目录，使 COPY answerAgent/... 生效
+      dockerfile: voice_system_livekit/Dockerfile
+    image: voice-system:latest
+    container_name: voice-system
+
+    # 所有服务全部跑在 host 网络，避免 WebSocket / LiveKit / vLLM 跨容器端口配置问题
+    network_mode: host
+
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      # LiveKit devmode 凭证（可在 .env 文件里覆盖）
+      - LIVEKIT_URL=${LIVEKIT_URL:-ws://localhost:7880}
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY:-devkey}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET:-secret}
+      # 如果终端不够宽，可以关掉前缀日志
+      - QUIET_TERMINAL_LOGS=${QUIET_TERMINAL_LOGS:-0}
+
+    volumes:
+      # ---- TTS 模型（CosyVoice3 权重，~2GB）----
+      - ${TTS_MODEL_DIR:-/data/models/Fun-CosyVoice3-0.5B}:/app/voice_system_livekit/tts/model/Fun-CosyVoice3-0.5B
+      # ---- STT 模型（FunASR SenseVoice，~300MB）----
+      - ${STT_MODEL_DIR:-/data/models/stt/models}:/app/voice_system_livekit/stt/model/models
+      # ---- FunAudioLLM / Qwen（ASR 依赖）----
+      - ${STT_AUDIO_DIR:-/data/models/stt/FunAudioLLM}:/app/voice_system_livekit/stt/model/FunAudioLLM
+      - ${STT_QWEN_DIR:-/data/models/stt/Qwen}:/app/voice_system_livekit/stt/model/Qwen
+      # ---- fawbot-agent 嵌入模型 + 知识库 ----
+      - ${FAWBOT_MODELS_DIR:-/data/models/hub}:/app/fawtd_agent/data/models/hub
+      # ---- vLLM 模型（Qwen3-8B，~16GB）----
+      - ${VLLM_MODEL_DIR:-/data/models/Qwen3-8B}:/app/fawtd_agent/model/Qwen3-8B
+      # ---- TTS 音色 WAV 资源（可选，已打进镜像）----
+      - ${TTS_ASSETS_DIR:-/data/tts_assets}:/app/voice_system_livekit/tts/assets
+      # ---- 日志持久化 ----
+      - ${LOG_DIR:-./log}:/app/voice_system_livekit/log
+      # ---- fawbot 数据（会话/日志）持久化 ----
+      - ${FAWBOT_DATA_DIR:-./fawbot_data}:/app/fawtd_agent/data
+
+    restart: unless-stopped
+    stdin_open: true
+    tty: true

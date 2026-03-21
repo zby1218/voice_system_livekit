@@ -1,0 +1,40 @@
+# ==============================================================
+# .dockerignore  —  build context 是 project/ 父目录
+#
+# 排除大体积模型文件，让镜像只包含代码和依赖
+# ==============================================================
+
+# ---- TTS 模型权重 ----
+voice_system_livekit/tts/model/Fun-CosyVoice3-0.5B/**
+!voice_system_livekit/tts/model/Fun-CosyVoice3-0.5B/README.md
+
+# ---- STT 模型权重 ----
+voice_system_livekit/stt/model/FunAudioLLM/
+voice_system_livekit/stt/model/Qwen/
+voice_system_livekit/stt/model/models/
+
+# ---- fawbot-agent 模型（vLLM / 嵌入模型）----
+answerAgent/fawtd_agent/model/
+answerAgent/fawtd_agent/data/models/
+
+# ---- 运行时日志、缓存、会话 ----
+voice_system_livekit/log/
+answerAgent/fawtd_agent/data/logs/
+answerAgent/fawtd_agent/data/sessions/
+
+# ---- Python 缓存 ----
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache/
+
+# ---- Git ----
+**/.git/
+**/.gitattributes
+
+# ---- 其他 IDE 文件 ----
+**/.vscode/
+**/.idea/
+**/*.swp
+**/node_modules/

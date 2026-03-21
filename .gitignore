@@ -45,6 +45,9 @@ Thumbs.db
 *.log
 kws/diagnostics/
 *.wav
+# 音色资源需纳入版本库（VOICE_CONFIGS 引用）
+!tts/assets/
+!tts/assets/*.wav
 *.npy
 
 # ============================================

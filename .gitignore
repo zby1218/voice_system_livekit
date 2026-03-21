@@ -1,8 +1,12 @@
 # ============================================
 # STT / TTS 模型 (体积大，不提交到 GitHub)
 # ============================================
-stt/model/
+# 主模型权重不提交（FunAudioLLM/Fun-ASR-Nano、Qwen 等）
+stt/model/FunAudioLLM/
+stt/model/Qwen/
 tts/model/
+# FunASR 依赖的辅助模型（VAD/标点）通过 Git LFS 跟踪
+# stt/model/models/ 不在此处忽略，整体纳入版本库
 
 # livekit-agents 内置音效（常为 Git LFS 指针，无本地 blob 时勿提交）
 livekit-agents/livekit/agents/resources/*.ogg

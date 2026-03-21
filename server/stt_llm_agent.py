@@ -3,40 +3,46 @@
 STT + LLM Agent (使用 AgentServer) - 语音识别后调用 LLM 并打印结果
 启动: python stt_llm_agent.py dev
 """
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
 import os
 import sys
 import time
-import json
-import websockets
-import asyncio
-import logging
+from dataclasses import dataclass
 from typing import Optional
 
+# 避免 socks 代理导致 httpx 报错 (Unknown scheme for proxy URL socks://...)
+for _p in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+    os.environ.pop(_p, None)
+
+import websockets
+
 from pipeline_logger import (
+    get_e2e_stt_result_at,
     init_pipeline_logging,
-    log_stt,
-    log_llm,
-    log_tts,
-    log_module,
     log_e2e,
-    set_e2e_start,
-    record_stt_result_time,
+    log_llm,
+    log_module,
+    log_stt,
+    log_tts,
+    log_tts_request_to_first_frame,
     record_e2e_end,
     record_llm_first_chunk_time,
+    record_stt_result_time,
     record_tts_request_time,
-    log_tts_request_to_first_frame,
-    get_e2e_stt_result_at,
+    set_e2e_start,
 )
 
-# 项目根目录
+# 项目根目录与日志目录
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _log_dir = os.path.join(_project_root, "log", "agent")
 os.makedirs(_log_dir, exist_ok=True)
 
-# 流水线日志：控制台 + log/agent/pipeline.log，带时间戳
 init_pipeline_logging(_log_dir, "pipeline.log")
 
-# 抑制所有 livekit/agents 的 INFO，只保留本进程的 pipeline 流水线日志，避免刷屏
 for _name in (
     "livekit",
     "livekit.agents",
@@ -49,285 +55,319 @@ for _name in (
 ):
     logging.getLogger(_name).setLevel(logging.WARNING)
 
-# 添加 stt 目录到路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "stt"))
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), "..", "tts"))
+
 from livekit import rtc
 from livekit.agents import (
     Agent,
-    AutoSubscribe,
     AgentServer,
     AgentSession,
+    AutoSubscribe,
     JobContext,
     JobProcess,
     cli,
 )
-from livekit.agents.voice.room_io import RoomOptions, AudioInputOptions
+from livekit.agents.metrics import LLMMetrics, STTMetrics, TTSMetrics
 from livekit.agents.voice.events import (
-    UserInputTranscribedEvent,
     ConversationItemAddedEvent,
     MetricsCollectedEvent,
+    UserInputTranscribedEvent,
+    UserStateChangedEvent,
 )
-from livekit.agents.metrics import LLMMetrics, STTMetrics, TTSMetrics
+from livekit.agents.voice.room_io import AudioInputOptions, RoomOptions
+from livekit.plugins import openai, silero
 
-
-from livekit.plugins import silero, openai
-
-# 导入自定义 STT
 from custom_stt import MySTT
-from qwen_stt import QwenSTT
 from custom_tts import CosyVoiceTTS
+from qwen_stt import QwenSTT
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-PROMPT_WAV_PATH = os.path.join(current_dir, "..", "tts", "assets", "zero_shot_prompt.wav")
 
-# LiveKit 本地开发环境
+# ---------------------------------------------------------------------------
+# 配置：集中管理路径与 KWS 参数，便于扩展与测试
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class AgentConfig:
+    """Agent 运行所需配置（路径、KWS、LiveKit 环境等）。"""
+
+    project_root: str
+    log_dir: str
+    kws_ws_uri: str
+    kws_sample_rate: int
+    kws_frame_size_ms: int
+
+
+def _load_config() -> AgentConfig:
+    return AgentConfig(
+        project_root=_project_root,
+        log_dir=_log_dir,
+        kws_ws_uri="ws://localhost:8765",
+        kws_sample_rate=16000,
+        kws_frame_size_ms=150,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 常驻 KWS 监听器：独立模块，仅依赖 session/room/track，便于单测与复用
+# ---------------------------------------------------------------------------
+class AlwaysOnKWSListener:
+    """从同一路麦克风轨道创建独立 AudioStream，持续送 KWS；检测到唤醒词后打断并说「我在听」。"""
+
+    def __init__(self, config: AgentConfig) -> None:
+        self._config = config
+
+    async def run(
+        self,
+        room: rtc.Room,
+        participant_identity: str,
+        track: rtc.RemoteTrack,
+        session: AgentSession,
+    ) -> None:
+        stream = rtc.AudioStream.from_track(
+            track=track,
+            sample_rate=self._config.kws_sample_rate,
+            num_channels=1,
+            frame_size_ms=self._config.kws_frame_size_ms,
+        )
+        try:
+            async with websockets.connect(self._config.kws_ws_uri) as ws:
+                await asyncio.gather(
+                    self._send_loop(stream, ws),
+                    self._recv_loop(ws, session),
+                )
+        except Exception as e:
+            logging.warning("[KWS always-on] connection/listener ended: %s", e)
+
+    async def _send_loop(self, stream: rtc.AudioStream, ws: websockets.WebSocketClientProtocol) -> None:
+        try:
+            async for event in stream:
+                await ws.send(event.frame.data.tobytes())
+        except Exception as e:
+            logging.warning("[KWS always-on] send_loop ended: %s", e)
+
+    async def _recv_loop(self, ws: websockets.WebSocketClientProtocol, session: AgentSession) -> None:
+        try:
+            while True:
+                msg = await ws.recv()
+                data = json.loads(msg)
+                if data.get("type") == "wake_detected" and data.get("success"):
+                    logging.info("[KWS always-on] 唤醒词检测到，执行打断")
+                    activity = getattr(session, "_activity", None)
+                    if activity is None:
+                        logging.warning("[KWS always-on] session._activity 未就绪，跳过")
+                        continue
+                    try:
+                        session.clear_user_turn()
+                    except Exception as e:
+                        logging.warning("[KWS always-on] clear_user_turn 失败: %s", e)
+                    try:
+                        activity.interrupt(force=True)
+                        session.say("我在听", allow_interruptions=False)
+                    except Exception as e:
+                        logging.warning("[KWS always-on] 打断失败: %s", e)
+        except Exception as e:
+            logging.warning("[KWS always-on] recv_loop ended: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# 流水线事件处理：封装 E2E 打点与日志状态，避免模块级全局变量
+# ---------------------------------------------------------------------------
+class PipelineEventHandler:
+    """处理 session 的 user_input_transcribed / conversation_item_added / metrics_collected，打流水线 log。"""
+
+    def __init__(self) -> None:
+        self._last_stt_duration: Optional[float] = None
+        self._last_llm_ttft: Optional[float] = None
+        self._llm_ttft_logged: bool = False
+
+    def on_user_input_transcribed(self, ev: UserInputTranscribedEvent) -> None:
+        if ev.is_final and (ev.transcript or "").strip():
+            self._llm_ttft_logged = False
+            record_stt_result_time(time.time())
+            log_stt(ev.transcript)
+
+    def on_conversation_item_added(self, ev: ConversationItemAddedEvent) -> None:
+        item = ev.item
+        if getattr(item, "role", None) == "assistant" and hasattr(item, "text_content"):
+            text = (getattr(item, "text_content") or "").strip()
+            if text:
+                log_llm(text)
+
+    def on_metrics_collected(self, ev: MetricsCollectedEvent) -> None:
+        m = ev.metrics
+        if isinstance(m, STTMetrics):
+            self._last_stt_duration = m.duration
+            log_module("STT推理", m.duration)
+        elif isinstance(m, LLMMetrics):
+            if not self._llm_ttft_logged:
+                self._llm_ttft_logged = True
+                self._last_llm_ttft = m.ttft
+                record_llm_first_chunk_time(time.time())
+                log_module("LLM首包", m.ttft)
+                stt_at = get_e2e_stt_result_at()
+                if stt_at is not None:
+                    log_module("STT结果 → LLM首包(墙钟)", max(0.0, time.time() - stt_at))
+        elif isinstance(m, TTSMetrics):
+            log_tts_request_to_first_frame()
+            log_tts("", duration_s=m.ttfb, chars=m.characters_count)
+            log_e2e(
+                stage_stt=self._last_stt_duration,
+                stage_llm=self._last_llm_ttft,
+                stage_tts=m.ttfb,
+            )
+
+
+# ---------------------------------------------------------------------------
+# 流水线组件工厂：STT / TTS / LLM 构建集中在一处，便于配置与替换
+# ---------------------------------------------------------------------------
+def build_pipeline_components(config: AgentConfig) -> tuple[MySTT, CosyVoiceTTS, openai.LLM]:
+    """根据配置构建 STT、TTS、LLM 实例（含 E2E 打点回调）。"""
+    my_stt = MySTT(
+        host="localhost",
+        port=10095,
+        ssl=False,
+        mode="2pass",
+        chunk_size=[5, 10, 5],
+        chunk_interval=10,
+        encoder_chunk_look_back=4,
+        decoder_chunk_look_back=0,
+        itn=True,
+        hotwords="",
+        on_segment_submitted=lambda: set_e2e_start(time.time()),
+    )
+    QwenSTT(
+        host="localhost",
+        port=10096,
+        ssl=False,
+        context="",
+        language=None,
+        chunk_interval_ms=60,
+    )
+    my_tts = CosyVoiceTTS(
+        base_url="http://localhost:50000",
+        endpoint="sft",
+        voice="default",
+        sample_rate=24000,
+        num_channels=1,
+        max_chars=140,
+        min_chars=25,
+        first_audio_deadline_s=60.0,
+        segment_deadline_s=180.0,
+        total_timeout_s=600.0,
+        add_silence_ms=80,
+        on_first_frame_pushed=lambda: record_e2e_end(time.time()),
+        on_tts_request_sent=lambda: record_tts_request_time(time.time()),
+    )
+    my_llm = openai.LLM(
+        model="qwen-plus-2025-12-01",
+        base_url="http://localhost:8001/v1",
+        # base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        api_key="sk-4ece3e68f5654afc8646e2fe6aabcfdd",
+        # api_key="1",
+    )
+    return my_stt, my_tts, my_llm
+
+
+# ---------------------------------------------------------------------------
+# LiveKit 环境与全局组件（由配置与工厂生成，供 entrypoint 使用）
+# ---------------------------------------------------------------------------
 os.environ.setdefault("LIVEKIT_URL", "ws://localhost:7880")
 os.environ.setdefault("LIVEKIT_API_KEY", "devkey")
 os.environ.setdefault("LIVEKIT_API_SECRET", "secret")
 
-KWS_WS_URI = "ws://localhost:8765"
-SAMPLE_RATE = 16000
-FRAME_SIZE_MS = 150
-
-async def _run_always_on_kws_listener(
-    room: rtc.Room,
-    participant_identity: str,
-    track: rtc.RemoteTrack,
-    session: AgentSession,
-) -> None:
-    """从同一路麦克风轨道创建独立 AudioStream，持续送 KWS；检测到唤醒词后打断当前播放并说「我在听」。"""
-    stream = rtc.AudioStream.from_track(
-        track=track,
-        sample_rate=SAMPLE_RATE,
-        num_channels=1,
-        frame_size_ms=FRAME_SIZE_MS,
-    )
-    try:
-        async with websockets.connect(KWS_WS_URI) as ws:
-            async def send_loop():
-                try:
-                    async for event in stream:
-                        await ws.send(event.frame.data.tobytes())
-                except Exception as e:
-                    logging.warning("[KWS always-on] send_loop ended: %s", e)
-
-            async def recv_loop():
-                try:
-                    while True:
-                        msg = await ws.recv()
-                        data = json.loads(msg)
-                        if data.get("type") == "wake_detected" and data.get("success"):
-                            logging.info("[KWS always-on] 唤醒词检测到，执行打断")
-                            activity = getattr(session, "_activity", None)
-                            if activity is None:
-                                logging.warning("[KWS always-on] session._activity 未就绪，跳过")
-                                continue
-
-                            # ① 无论打断是否成功，都必须清空 STT 状态
-                            #    防止唤醒词这一句被 STT 识别后提交给 LLM 产生错位回答
-                            try:
-                                session.clear_user_turn()
-                            except Exception as e:
-                                logging.warning("[KWS always-on] clear_user_turn 失败: %s", e)
-
-                            # ② 强制打断当前语音并播「我在听」
-                            #    force=True：allow_interruptions=False 时也能打断
-                            #    唤醒词场景下，用户主动唤醒优先级最高，应无条件打断
-                            try:
-                                activity.interrupt(force=True)
-                                session.say("我在听", allow_interruptions=False)
-                            except Exception as e:
-                                logging.warning("[KWS always-on] 打断失败: %s", e)
-                except Exception as e:
-                    logging.warning("[KWS always-on] recv_loop ended: %s", e)
-
-            await asyncio.gather(send_loop(), recv_loop())
-    except Exception as e:
-        logging.warning("[KWS always-on] connection/listener ended: %s", e)
+CONFIG = _load_config()
+MY_STT, MY_TTS, MY_LLM = build_pipeline_components(CONFIG)
 
 
-# ========== STT 实例 ==========
-# on_segment_submitted: 音频段提交给 STT 时回调，用作 E2E 起点（从给 STT 到 TTS 首帧）
-my_stt = MySTT(
-    host="localhost",
-    port=10095,
-    ssl=False,
-    mode="2pass",
-    chunk_size=[5, 10, 5],
-    chunk_interval=10,
-    encoder_chunk_look_back=4,
-    decoder_chunk_look_back=0,
-    itn=True,
-    hotwords="",
-    on_segment_submitted=lambda: set_e2e_start(time.time()),
-)
-
-qwen_stt = QwenSTT(
-    host="localhost",
-    port=10096,
-    ssl=False,
-    context="",
-    language=None,
-    chunk_interval_ms=60
-)
-
-# ========== TTS 实例 (CosyVoice) ==========
-my_tts = CosyVoiceTTS(
-    base_url="http://localhost:50000",
-    endpoint="zero_shot",
-    prompt_wav_path=PROMPT_WAV_PATH,
-    prompt_text="You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。",
-    sample_rate=24000,
-    num_channels=1,
-    max_chars=140,
-    min_chars=25,
-    first_audio_deadline_s=60.0,
-    segment_deadline_s=180.0,
-    total_timeout_s=600.0,
-    add_silence_ms=80,
-    on_first_frame_pushed=lambda: record_e2e_end(time.time()),  # TTS 首帧 push 时记 E2E 终点
-    on_tts_request_sent=lambda: record_tts_request_time(time.time()),  # 向 TTS 发请求时打点，与首帧相减=请求→首帧
-)
-
-# ========== LLM 实例 (阿里云 Dashscope Qwen) ==========
-my_llm = openai.LLM(
-    model="qwen-plus-2025-12-01",
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    # base_url="http://192.168.68.65:8001/v1",
-    api_key="sk-4ece3e68f5654afc8646e2fe6aabcfdd"
-    # api_key="",
-
-)
-
-
+# ---------------------------------------------------------------------------
+# Agent 定义与 Server
+# ---------------------------------------------------------------------------
 class MyAgent(Agent):
-    """简单的 Agent，只做 STT + LLM，不做 TTS"""
-    
+    """简单 Agent：STT + LLM + TTS，用简洁中文回答。"""
+
     def __init__(self) -> None:
         super().__init__(
             instructions="你是一个友好的助手，用简洁的中文回答问题。保持回复简短。",
         )
 
 
-# ---------- 流水线事件：只打 STT/LLM/TTS/耗时/E2E/VAD ----------
-# E2E 起点在 custom_stt 发送 is_speaking=False 时由 on_segment_submitted 设置
-_last_stt_duration: Optional[float] = None
-_last_llm_ttft: Optional[float] = None  # STT结果→首chunk 耗时，用于 E2E 阶段和
-_llm_ttft_logged: bool = False
-
-
-def _on_user_input_transcribed(ev: UserInputTranscribedEvent) -> None:
-    global _llm_ttft_logged
-    if ev.is_final and (ev.transcript or "").strip():
-        _llm_ttft_logged = False
-        record_stt_result_time(time.time())
-        log_stt(ev.transcript)
-
-
-def _on_conversation_item_added(ev: ConversationItemAddedEvent) -> None:
-    item = ev.item
-    if getattr(item, "role", None) == "assistant" and hasattr(item, "text_content"):
-        text = (getattr(item, "text_content") or "").strip()
-        if text:
-            log_llm(text)
-
-
-def _on_metrics_collected(ev: MetricsCollectedEvent) -> None:
-    global _last_stt_duration, _last_llm_ttft, _llm_ttft_logged
-    m = ev.metrics
-    if isinstance(m, STTMetrics):
-        _last_stt_duration = m.duration
-        log_module("STT推理", m.duration)
-    elif isinstance(m, LLMMetrics):
-        if not _llm_ttft_logged:
-            _last_llm_ttft = m.ttft
-            _llm_ttft_logged = True
-            record_llm_first_chunk_time(time.time())
-            log_module("LLM首包", m.ttft)
-            # pip 无 E2ETimingEvent，用墙钟补算「STT 结果 → 收到 LLM 首包」间隔
-            stt_at = get_e2e_stt_result_at()
-            if stt_at is not None:
-                log_module("STT结果 → LLM首包(墙钟)", max(0.0, time.time() - stt_at))
-    elif isinstance(m, TTSMetrics):
-        log_tts_request_to_first_frame()  # 请求时刻→首帧时刻 的墙钟耗时
-        log_tts("", duration_s=m.ttfb, chars=m.characters_count)
-        log_e2e(
-            stage_stt=_last_stt_duration,
-            stage_llm=_last_llm_ttft,
-            stage_tts=m.ttfb,
-        )
-
-
-# ========== AgentServer 方式 (和 myagent.py 一致) ==========
 server = AgentServer()
 
 
-def prewarm(proc: JobProcess):
-    """预热：加载 VAD 模型"""
+def prewarm(proc: JobProcess) -> None:
+    """预热：加载 VAD 模型。"""
     proc.userdata["vad"] = silero.VAD.load(
-        activation_threshold=0.5, # 超过0.5判断在说话
-        deactivation_threshold=0.3, # 超过0.3判断说话结束
-        min_speech_duration=0.2, # 超过0.2s判断在说话
-        min_silence_duration=0.5, # 超过0.5s判断说话结束，进行识别
+        activation_threshold=0.5,
+        deactivation_threshold=0.3,
+        min_speech_duration=0.2,
+        min_silence_duration=0.5,
     )
 
 
 server.setup_fnc = prewarm
 
 
-
 @server.rtc_session()
-async def entrypoint(ctx: JobContext):
-    # 1. 连接房间
+async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-    
-    # 2. 等待用户 (这一步其实 session.start 内部也会做，但写在这里更稳妥)
     participant = await ctx.wait_for_participant()
-    participant_identity = participant.identity  # 供常驻 KWS 的 track_subscribed 回调使用
+    participant_identity = participant.identity
 
-    # 3. 初始化 Session（pip 版无 kws_enabled，唤醒与打断由下方常驻 KWS 负责）
     session = AgentSession(
-        stt=my_stt,
-        llm=my_llm,
-        tts=my_tts,
+        stt=MY_STT,
+        llm=MY_LLM,
+        tts=MY_TTS,
         vad=ctx.proc.userdata["vad"],
-        # allow_interruptions=False：agent 播放时用户说话不送 STT，防止误触发 LLM
-        # 唤醒词打断通过 always-on KWS + force=True interrupt 实现
         allow_interruptions=False,
+        # TTS 播放期间仍保留用户音频送 STT，避免用户开口时机被丢失
+        discard_audio_if_uninterruptible=False,
     )
 
-    session.on("user_input_transcribed", _on_user_input_transcribed)
-    session.on("conversation_item_added", _on_conversation_item_added)
-    session.on("metrics_collected", _on_metrics_collected)
+    pipeline_handler = PipelineEventHandler()
+    session.on("user_input_transcribed", pipeline_handler.on_user_input_transcribed)
+    session.on("conversation_item_added", pipeline_handler.on_conversation_item_added)
+    session.on("metrics_collected", pipeline_handler.on_metrics_collected)
 
-    # @session.on("user_state_changed")
-    # def on_user_state_changed(ev: UserStateChangedEvent):
-    #     if ev.new_state == "away":
-    #         print("用户状态转为离开")
-    #         session.say("我先休息了, 有事情再叫我吧", allow_interruptions=True)
-    #         # asyncio.create_task(
-    #         #     session.say("我先休息了", allow_interruptions=True)
-    #         # )
-    _kws_listener_task: asyncio.Task | None = None
+    # 休眠逻辑（pip 版无内置）：用户 away 时播休眠语并通知 client，不修改源码
+    room = ctx.room
+
+    def _on_user_state_changed(ev: UserStateChangedEvent) -> None:
+        if ev.new_state != "away":
+            return
+        logging.info("用户状态变为 away，进入休眠")
+        session.say("我先休息了，有事再叫我吧", allow_interruptions=False)
+        asyncio.create_task(_notify_client_sleep(room))
+
+    async def _notify_client_sleep(r: rtc.Room) -> None:
+        try:
+            await r.local_participant.publish_data(b"session_end", reliable=True)
+            logging.debug("已通知 client 进入休眠")
+        except Exception as e:
+            logging.warning("通知 client 休眠失败: %s", e)
+
+    session.on("user_state_changed", _on_user_state_changed)
+
+    kws_listener = AlwaysOnKWSListener(CONFIG)
+    kws_task: Optional[asyncio.Task[None]] = None
+
     @ctx.room.on("track_subscribed")
     def _on_track_subscribed(
         track: rtc.Track,
         publication: rtc.RemoteTrackPublication,
-        participant: rtc.RemoteParticipant,
+        pub_participant: rtc.RemoteParticipant,
     ) -> None:
-        nonlocal _kws_listener_task
-        if participant.identity != participant_identity:
+        nonlocal kws_task
+        if pub_participant.identity != participant_identity:
             return
         if publication.source != rtc.TrackSource.SOURCE_MICROPHONE:
             return
         if not publication.track:
             return
-        # 只起一个常驻 KWS 任务，避免重复
-        if _kws_listener_task is not None and not _kws_listener_task.done():
+        if kws_task is not None and not kws_task.done():
             return
-        _kws_listener_task = asyncio.create_task(
-            _run_always_on_kws_listener(ctx.room, participant_identity, publication.track, session)
+        session.say("你好~", allow_interruptions=False)
+        kws_task = asyncio.create_task(
+            kws_listener.run(ctx.room, participant_identity, publication.track, session)
         )
         
     await session.start(
@@ -337,6 +377,9 @@ async def entrypoint(ctx: JobContext):
             audio_input=AudioInputOptions(sample_rate=16000, frame_size_ms=150),
         ),
     )
+
+    # 连接建立后播一句「我在呢」
+    # session.say("你好~", allow_interruptions=False)
 
 
 if __name__ == "__main__":

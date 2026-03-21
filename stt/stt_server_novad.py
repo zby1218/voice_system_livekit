@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import json
+import time
 import asyncio
 import logging
 import traceback
@@ -42,6 +43,12 @@ def _setup_logging(log_subdir: str) -> None:
 # ---------------------------------------------------------------------------
 # 配置与常量
 # ---------------------------------------------------------------------------
+
+# 说话人分离开关：改为 True 即启用 MossFormer2_SS_16K 前处理（走独立 speaker 服务），False 则直通
+ENABLE_SPEAKER_SELECT: bool = False
+# speaker 服务地址（需先在本机启动：python -m speaker_select.server）
+SPEAKER_SERVICE_URL: str = "http://127.0.0.1:1999/separate"
+
 
 @dataclass(frozen=True)
 class ASRServerConfig:
@@ -160,7 +167,7 @@ class TextFilter:
         if n >= self._single_char_repeat_min and len(set(clean)) == 1:
             return True, f"单字符重复 ×{n}: {clean[0]!r}"
 
-        # 3. 短语大量重复（如"你好你好你好你好"）
+        # 3. 短语大量重复（如"你好你好你好你好"）—— 整串恰好是某单元的整倍数
         max_unit_len = n // self._phrase_repeat_min
         for unit_len in range(2, max_unit_len + 1):
             repeats, remainder = divmod(n, unit_len)
@@ -168,6 +175,21 @@ class TextFilter:
                 continue
             if repeats >= self._phrase_repeat_min and clean == clean[:unit_len] * repeats:
                 return True, f"短语重复 ×{repeats}: {clean[:unit_len]!r}"
+
+        # 4. 高频短语主导文本（带任意前缀/后缀，如"嗯天工天工天工..."）
+        #    取靠前若干位置的候选单元，统计其在全串的非重叠出现次数；
+        #    若某单元出现次数 × 单元长度 ≥ 全串 70%，则视为重复幻觉。
+        max_unit_len = min(6, n // self._phrase_repeat_min)
+        for unit_len in range(2, max_unit_len + 1):
+            checked: set[str] = set()
+            for start in range(min(n - unit_len + 1, unit_len * 2)):
+                unit = clean[start:start + unit_len]
+                if unit in checked:
+                    continue
+                checked.add(unit)
+                count = clean.count(unit)
+                if count >= self._phrase_repeat_min and count * unit_len * 10 >= n * 7:
+                    return True, f"高频短语重复 ×{count}: {unit!r}"
 
         return False, ""
 
@@ -254,6 +276,7 @@ class ASRServer:
         self._logger.info("✅ %s 路径确认: %s", name, path)
 
     def load_models(self) -> None:
+        import funasr.models.fun_asr_nano.model  # noqa: F401 — 注册 FunASRNano（FunASR 1.3.x）
         from funasr import AutoModel
 
         self._logger.info("开始加载模型 (Device: %s)...", self._device)
@@ -270,6 +293,9 @@ class ASRServer:
         except Exception as e:
             self._logger.error("❌ 模型加载崩溃: %s", e)
             sys.exit(1)
+
+        if ENABLE_SPEAKER_SELECT:
+            self._logger.info("已启用说话人分离，将请求独立服务: %s", SPEAKER_SERVICE_URL)
 
     async def start(self) -> None:
         self.load_models()
@@ -356,6 +382,8 @@ class ASRServer:
                     await self._handle_text_message(websocket, session, message, frames_asr, client_id)
                 else:
                     frames_asr.append(message)
+                    if len(frames_asr) == 1:
+                        self._logger.info("[%s] 开始接收音频帧", client_id)
         except websockets.ConnectionClosed:
             client_logger.info("[%s] 客户端断开连接", client_id)
             self._logger.info("[%s] 客户端断开连接", client_id)
@@ -380,6 +408,7 @@ class ASRServer:
     ) -> None:
         log = self._client_logger(websocket)
         log.info("[%s] 📨 Received text message: %s", client_id, message[:200])
+        self._logger.info("[%s] 📨 Received text message: %s", client_id, message[:200])
         try:
             msg = json.loads(message)
         except Exception as e:
@@ -406,13 +435,42 @@ class ASRServer:
 
         session.is_speaking = msg["is_speaking"]
         session.status_dict_asr_online["is_final"] = not session.is_speaking
-
+        print("is_speaking", session.is_speaking)
         if not session.is_speaking:
             if len(frames_asr) > 0:
                 audio_in = b"".join(frames_asr)
+                self._logger.info("[%s] is_speaking=False，收到 %d 帧 (%d bytes)，开始推理",
+                                  client_id, len(frames_asr), len(audio_in))
+                if ENABLE_SPEAKER_SELECT:
+                    try:
+                        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                        if project_root not in sys.path:
+                            sys.path.insert(0, project_root)
+                        from speaker_select.client import separate_via_service
+                        speaker_select_start_time = time.time()
+                        first_speaker = await asyncio.get_running_loop().run_in_executor(
+                            self._executor,
+                            separate_via_service,
+                            audio_in,
+                            SPEAKER_SERVICE_URL,
+                        )
+                        speaker_select_time = time.time() - speaker_select_start_time
+                        self._logger.info(
+                            "[%s] 说话人分离完成，耗时 %.3f 秒", client_id, speaker_select_time
+                        )
+                        if first_speaker:
+                            audio_in = first_speaker
+                            self._logger.info(
+                                "[%s] 说话人分离完成，取第一路 (%d bytes)", client_id, len(audio_in)
+                            )
+                    except Exception as e:
+                        self._logger.warning(
+                            "[%s] 说话人分离失败，使用原始音频: %s", client_id, e
+                        )
                 await self._async_asr_offline(websocket, session, audio_in, client_id)
             else:
-                log.info("[%s] is_speaking=False 但无音频帧，跳过推理", client_id)
+                self._logger.info("[%s] is_speaking=False 但无音频帧，跳过推理", client_id)
+                await self._send_empty_final(websocket)
             frames_asr.clear()
             session.status_dict_asr_online["cache"] = {}
 
@@ -432,6 +490,7 @@ class ASRServer:
         audio_in: bytes,
         client_id: str = "",
     ) -> None:
+        print("有语音进行推理")
         log = self._client_logger(websocket)
         if len(audio_in) == 0:
             await self._send_empty_final(websocket)
@@ -442,6 +501,7 @@ class ASRServer:
             await self._send_empty_final(websocket)
             return
 
+
         try:
             audio_tensor = self._decode_audio_chunk(audio_in)
             res = await self._run_model_inference(
@@ -451,15 +511,18 @@ class ASRServer:
                 hotwords=list(self._config.default_hotwords),
                 itn=session.itn,
             )
+            print("res", res)
             text = res[0]["text"] if res else ""
 
             filter_out, reason = self._text_filter.should_filter(text)
             if filter_out:
                 log.info("[%s] 过滤幻觉文本 (%s): %r", client_id, reason, text)
+                self._logger.info("[%s] 过滤幻觉文本 (%s): %r", client_id, reason, text)
                 await self._send_empty_final(websocket)
                 return
 
             log.info("[%s] Final Result: %s", client_id, text)
+            self._logger.info("[%s] Final Result: %s", client_id, text)
 
             await websocket.send(json.dumps({
                 "mode": "2pass-offline", "text": text, "is_final": True

@@ -478,9 +478,9 @@ async def run_client(
     face_resume_port: Optional[int] = None,
     room_name: Optional[str] = None,
     apm_echo_cancellation: bool = True,
-    apm_noise_suppression: bool = True,
-    apm_high_pass_filter: bool = True,
-    apm_auto_gain_control: bool = True,
+    apm_noise_suppression: bool = False,
+    apm_high_pass_filter: bool = False,
+    apm_auto_gain_control: bool = False,
 ) -> None:
     """
     便捷入口：创建 FaceLiveKitClient 并运行。

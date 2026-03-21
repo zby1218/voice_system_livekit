@@ -71,7 +71,9 @@ logger = logging.getLogger("tts_server")
 
 # ========== 音色配置 ==========
 VOICE_CONFIGS = [
-    {"id": "default", "file": "zero_shot_prompt.wav",
+    {"id": "default", "file": "robot.wav",
+    "prompt_text": "You are a helpful assistant.用稍快的语速，平静的语气来回答<|endofprompt|>大家好，我来自一汽机器人"},
+    {"id": "longanhuan", "file": "zero_shot_prompt.wav",
      "prompt_text": "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。"},
     {"id": "longyingcheng", "file": "longyingcheng_man.wav",
      "prompt_text": "You are a helpful assistant.<|endofprompt|>真不好意思，从小至今，他还从来没有被哪一位异性朋友亲吻过呢。"},
@@ -597,7 +599,7 @@ async def inference_zero_shot(
     session = _resolve_session_id(session_id, request)
     mode = _normalize_interrupt_mode(interrupt_mode)
     logger.info(
-        f"[ZeroShot] session={session} mode={mode} text='{tts_text[:30]}...' prompt='{prompt_text[:20]}...'"
+        f"[ZeroShot] session={session} mode={mode} text='{tts_text}' prompt='{prompt_text[:20]}...'"
     )
     start_time = time.time()
     
@@ -682,7 +684,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", help="设备 (cuda/cpu)")
     parser.add_argument("--fp16", action="store_true", default=True, help="使用 FP16")
     parser.add_argument("--no-fp16", action="store_false", dest="fp16", help="不使用 FP16")
-    parser.add_argument("--vllm", action="store_true", default=True, help="使用 vLLM")
+    parser.add_argument("--vllm", action="store_true", default=False, help="使用 vLLM")
     parser.add_argument("--sample-rate", type=int, default=24000, help="输出采样率")
     parser.add_argument("--max-concurrent", type=int, default=2, help="最大并发请求数 (32GB 显存建议 2-3)")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="监听地址")

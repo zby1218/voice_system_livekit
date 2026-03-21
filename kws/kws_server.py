@@ -369,7 +369,7 @@ def main():
                         help="模型路径")
     parser.add_argument("--keywords", type=str, default="小莫小莫,你好小莫", 
                         help="唤醒词,用逗号分隔")
-    parser.add_argument("--threshold", type=float, default=0.4, 
+    parser.add_argument("--threshold", type=float, default=0.2, 
                         help="唤醒阈值 (0.0-1.0)")
     parser.add_argument("--host", type=str, default="0.0.0.0", 
                         help="服务器地址")

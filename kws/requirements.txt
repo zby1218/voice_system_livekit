@@ -7,3 +7,4 @@ torch==2.10.0
 torchaudio==2.10.0
 PyAudio==0.2.14
 websockets==16.0
+sounddevice==0.5.5

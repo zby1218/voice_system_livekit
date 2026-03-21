@@ -4,6 +4,9 @@
 stt/model/
 tts/model/
 
+# livekit-agents 内置音效（常为 Git LFS 指针，无本地 blob 时勿提交）
+livekit-agents/livekit/agents/resources/*.ogg
+
 
 # ============================================
 # Python

@@ -72,18 +72,13 @@ logger = logging.getLogger("tts_server")
 # ========== 音色配置 ==========
 VOICE_CONFIGS = [
     {"id": "default", "file": "robot.wav",
-    "prompt_text": "You are a helpful assistant.用稍快的语速，平静的语气来回答<|endofprompt|>大家好，我来自一汽机器人"},
+    "prompt_text": "You are a helpful assistant.用最大的音量来回答<|endofprompt|>大家好，我来自一汽机器人"},
     {"id": "longanhuan", "file": "zero_shot_prompt.wav",
      "prompt_text": "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。"},
-    {"id": "longyingcheng", "file": "longyingcheng_man.wav",
-     "prompt_text": "You are a helpful assistant.<|endofprompt|>真不好意思，从小至今，他还从来没有被哪一位异性朋友亲吻过呢。"},
-    {"id": "longyingwan", "file": "longyingwan_woman.wav",
-     "prompt_text": "You are a helpful assistant.<|endofprompt|>我们将为全球城市的可持续发展贡献力量。"},
-    {"id": "longyingmu", "file": "longyingmu_woman.wav",
-     "prompt_text": "You are a helpful assistant.<|endofprompt|>您好，我是智能电话助手，很高兴为您服务。请问您需要咨询业务预约办理还是查询信息？"}
+    
 ]
 
-
+# 用稍快的语速，平静的语气来回答
 class RequestCancelledError(RuntimeError):
     """请求在排队或推理阶段被取消。"""
 
@@ -104,6 +99,36 @@ def _resolve_session_id(session_id: Optional[str], request: Request) -> str:
         return session_id.strip()
     host = request.client.host if request.client else "unknown"
     return f"client:{host}"
+
+
+def _configure_cuda_environment(device: str) -> str:
+    """将 cuda:N 映射为单卡可见环境，避免库内部出现 cuda:0/cuda:N 混用。"""
+    normalized = (device or "cuda").strip().lower()
+    if not normalized.startswith("cuda:"):
+        return device
+
+    index_text = normalized.split(":", 1)[1].strip()
+    if not index_text.isdigit():
+        raise ValueError(f"非法设备参数: {device}，期望格式如 cuda:1")
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = index_text
+    return "cuda"
+
+
+# ========== 音频后处理 ==========
+
+_AUDIO_GAIN: float = 2.0  # 响度增益倍数，1.0 = 不变
+
+# 将输出的音频流进行响度增益处理，增益倍数为2倍
+def amplify_pcm(pcm_bytes: bytes, gain: float = _AUDIO_GAIN) -> bytes:
+    """软限幅增益：将 16-bit PCM 放大 gain 倍，用 tanh 平滑压限防止截断失真。
+    逐帧调用安全，无跨帧依赖，几乎不增加耗时（numpy SIMD，<0.1ms/帧）。
+    """
+    import numpy as _np
+    samples = _np.frombuffer(pcm_bytes, dtype=_np.int16).astype(_np.float32)
+    samples /= 32768.0
+    samples = _np.tanh(samples * gain)
+    return (samples * 32768).clip(-32768, 32767).astype(_np.int16).tobytes()
 
 
 class TTSEngine:
@@ -303,6 +328,7 @@ class TTSEngine:
         request_id = self._register_request(session_id, interrupt_mode)
         acquired = False
         cancelled = False
+
         try:
             self._acquire_slot(request_id)
             acquired = True
@@ -314,17 +340,20 @@ class TTSEngine:
                     cancelled = True
                     self.logger.info("⚠️ 请求 #%s 在推理阶段被取消", request_id)
                     break
+
                 if first_chunk:
                     rec = self._request_metrics.get(request_id)
                     if rec is not None:
                         rec.record_first_byte()
                     first_chunk = False
                 audio = result['tts_speech']
+                
                 if self.output_sample_rate != self.model_sample_rate:
                     audio = self.torchaudio.functional.resample(
                         audio, self.model_sample_rate, self.output_sample_rate
                     )
-                yield (audio * 32768).to(self.torch.int16).cpu().numpy().tobytes()
+                yield amplify_pcm((audio * 32768).to(self.torch.int16).cpu().numpy().tobytes())
+        
         except RequestCancelledError:
             cancelled = True
             self.logger.info("⚠️ 请求 #%s 在排队阶段被取消", request_id)
@@ -334,54 +363,6 @@ class TTSEngine:
             else:
                 self._drop_request_without_slot(request_id, "cancelled_before_acquire")
     
-    def synthesize_cross_lingual(
-        self,
-        text: str,
-        prompt_wav_bytes: bytes,
-        *,
-        session_id: str = "default",
-        interrupt_mode: InterruptMode = "normal",
-    ) -> Generator[bytes, None, None]:
-        """跨语言合成 - 使用上传的参考音频（支持并发）"""
-        if not self.loaded or not text.strip():
-            return
-        
-        # 保存临时文件
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(prompt_wav_bytes)
-            temp_path = f.name
-        
-        request_id = self._register_request(session_id, interrupt_mode)
-        acquired = False
-        cancelled = False
-        try:
-            self._acquire_slot(request_id)
-            acquired = True
-            first_chunk = True
-            for result in self.cosyvoice.inference_cross_lingual(text, temp_path, stream=True):
-                if self._request_control.is_cancelled(request_id):
-                    cancelled = True
-                    self.logger.info("⚠️ 请求 #%s 在推理阶段被取消", request_id)
-                    break
-                if first_chunk:
-                    rec = self._request_metrics.get(request_id)
-                    if rec is not None:
-                        rec.record_first_byte()
-                    first_chunk = False
-                audio = result['tts_speech']
-                if self.output_sample_rate != self.model_sample_rate:
-                    audio = self.torchaudio.functional.resample(audio, self.model_sample_rate, self.output_sample_rate)
-                yield (audio * 32768).to(self.torch.int16).cpu().numpy().tobytes()
-        except RequestCancelledError:
-            cancelled = True
-            self.logger.info("⚠️ 请求 #%s 在排队阶段被取消", request_id)
-        finally:
-            if acquired:
-                self._release_slot(request_id, cancelled=cancelled)
-            else:
-                self._drop_request_without_slot(request_id, "cancelled_before_acquire")
-            os.unlink(temp_path)
     
     def synthesize_zero_shot(
         self,
@@ -429,7 +410,7 @@ class TTSEngine:
                     audio = result['tts_speech']
                     if self.output_sample_rate != self.model_sample_rate:
                         audio = self.torchaudio.functional.resample(audio, self.model_sample_rate, self.output_sample_rate)
-                    yield (audio * 32768).to(self.torch.int16).cpu().numpy().tobytes()
+                    yield amplify_pcm((audio * 32768).to(self.torch.int16).cpu().numpy().tobytes())
             except RequestCancelledError:
                 cancelled = True
                 self.logger.info("⚠️ 请求 #%s 在排队阶段被取消", request_id)
@@ -466,7 +447,7 @@ class TTSEngine:
                     audio = result['tts_speech']
                     if self.output_sample_rate != self.model_sample_rate:
                         audio = self.torchaudio.functional.resample(audio, self.model_sample_rate, self.output_sample_rate)
-                    yield (audio * 32768).to(self.torch.int16).cpu().numpy().tobytes()
+                    yield amplify_pcm((audio * 32768).to(self.torch.int16).cpu().numpy().tobytes())
             except RequestCancelledError:
                 cancelled = True
                 self.logger.info("⚠️ 请求 #%s 在排队阶段被取消", request_id)
@@ -539,44 +520,6 @@ async def inference_sft(
     
     return StreamingResponse(gen(), media_type="application/octet-stream",
                             headers={"X-Sample-Rate": str(tts_engine.output_sample_rate)})
-
-
-@app.post("/inference_cross_lingual")
-async def inference_cross_lingual(
-    request: Request,
-    tts_text: str = Form(...),
-    prompt_wav: UploadFile = File(...),
-    session_id: Optional[str] = Form(default=None),
-    interrupt_mode: str = Form(default="normal"),
-):
-    """跨语言推理 (上传参考音频)"""
-    if not tts_engine or not tts_engine.loaded:
-        raise HTTPException(503, "模型未加载")
-    if not tts_text.strip():
-        raise HTTPException(400, "文本为空")
-    
-    prompt_bytes = await prompt_wav.read()
-    session = _resolve_session_id(session_id, request)
-    mode = _normalize_interrupt_mode(interrupt_mode)
-    logger.info(f"[CrossLingual] session={session} mode={mode} text='{tts_text[:30]}...'")
-    start_time = time.time()
-    
-    def gen():
-        first = True
-        for chunk in tts_engine.synthesize_cross_lingual(
-            tts_text,
-            prompt_bytes,
-            session_id=session,
-            interrupt_mode=mode,
-        ):
-            if first:
-                logger.info(f"[CrossLingual] ⏱️ 首包延迟: {time.time() - start_time:.3f}s")
-                first = False
-            yield chunk
-    
-    return StreamingResponse(gen(), media_type="application/octet-stream",
-                            headers={"X-Sample-Rate": str(tts_engine.output_sample_rate)})
-
 
 @app.post("/inference_zero_shot")
 async def inference_zero_shot(
@@ -686,11 +629,23 @@ def main():
     parser.add_argument("--no-fp16", action="store_false", dest="fp16", help="不使用 FP16")
     parser.add_argument("--vllm", action="store_true", default=False, help="使用 vLLM")
     parser.add_argument("--sample-rate", type=int, default=24000, help="输出采样率")
-    parser.add_argument("--max-concurrent", type=int, default=2, help="最大并发请求数 (32GB 显存建议 2-3)")
+    parser.add_argument("--max-concurrent", type=int, default=2, help="最大并发请求数")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="监听地址")
     parser.add_argument("--port", type=int, default=50000, help="监听端口")
     
     args = parser.parse_args()
+    try:
+        original_device = args.device
+        args.device = _configure_cuda_environment(args.device)
+        if original_device != args.device:
+            logger.info(
+                "检测到多卡参数 %s，已设置 CUDA_VISIBLE_DEVICES=%s，进程内设备统一为 %s",
+                original_device,
+                os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+                args.device,
+            )
+    except ValueError as exc:
+        parser.error(str(exc))
     
     logger.info("=" * 60)
     logger.info("启动 TTS Server")

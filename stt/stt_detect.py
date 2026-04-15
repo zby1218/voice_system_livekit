@@ -1,6 +1,14 @@
 import os
 import tempfile
 
+# 推理 wav 目录（可用环境变量 STT_INFERENCE_WAV_DIR 覆盖）
+DEFAULT_INFERENCE_WAV_DIR = os.environ.get(
+    "STT_INFERENCE_WAV_DIR",
+    "/home/zhangchi/project/kws_deploy/log/stt/inference_wav",
+)
+# 只改这里：上述目录下的 wav 文件名，然后运行 python stt_detect.py
+INFERENCE_WAV_FILENAME = "20260321_182002_59858_0bad18fd.wav"
+
 # FunASR 1.3.x 不会在 import funasr 时加载 fun_asr_nano，必须先导入该子模块，
 # 否则 config.yaml 里的 model: FunASRNano 无法注册，会报「FunASRNano is not registered」
 import funasr.models.fun_asr_nano.model  # noqa: F401
@@ -74,6 +82,8 @@ def transcribe_long_audio(model, audio_path: str, **generate_kw) -> str:
 def main():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     model_dir = os.path.join(current_dir, "model", "FunAudioLLM", "Fun-ASR-Nano-2512")
+    inference_wav_dir = DEFAULT_INFERENCE_WAV_DIR
+    wav_path = os.path.join(inference_wav_dir, INFERENCE_WAV_FILENAME)
 
     model = AutoModel(
         model=model_dir,
@@ -83,11 +93,16 @@ def main():
         disable_pbar=True,
     )
 
-    wav_path = os.path.join(model_dir, "example", "test1.wav")
     if not os.path.isfile(wav_path):
-        print(f"示例音频不存在，请放入: {wav_path}")
+        print(
+            f"未找到 wav 文件。\n"
+            f"  路径: {wav_path}\n"
+            f"请确认 INFERENCE_WAV_FILENAME（当前为 {INFERENCE_WAV_FILENAME!r}）"
+            f" 与目录内实际文件名一致。"
+        )
         return
 
+    print(f"使用音频: {wav_path}")
     gen_kw = dict(language="中文", itn=True)
     dur = audio_duration_sec(wav_path)
     print(f"音频时长约 {dur:.1f}s，阈值 {MAX_DURATION_SEC_DIRECT}s → ", end="")

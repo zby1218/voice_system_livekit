@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -53,8 +52,6 @@ class SessionConfig:
     """会话与断连相关常量。"""
 
     room_name_prefix: str = "kws_room"
-    kws_resume_host: str = "127.0.0.1"
-    kws_resume_port: int = 9997
     session_end_audio_idle_sec: float = 1.0
     session_end_voice_threshold: int = 200
     session_end_audio_wait_timeout: float = 30.0
@@ -112,17 +109,6 @@ def _ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)) + ".%03d" % int((t % 1) * 1000)
 
 
-def _send_resume_to_kws(host: str, port: int) -> None:
-    """给 kws_wake_listener 发一条 resume（TCP 一发一收），Listener 收到后会提前结束阻塞并重启 KWS 检测。"""
-    try:
-        with socket.create_connection((host, port), timeout=5.0) as s:
-            s.sendall(
-                json.dumps({"event": "resume"}, ensure_ascii=False).encode("utf-8") + b"\n"
-            )
-    except (socket.error, OSError):
-        pass
-
-
 # ========== KWS LiveKit 客户端 ==========
 
 
@@ -139,18 +125,10 @@ class KwsLiveKitClient:
         config: Optional[KwsClientConfig] = None,
         *,
         keyword: str = "",
-        kws_resume_host: Optional[str] = None,
-        kws_resume_port: Optional[int] = None,
         room_name: Optional[str] = None,
     ) -> None:
         self._config = config or KwsClientConfig()
         self._keyword = keyword
-        self._kws_resume_host = kws_resume_host or self._config.session.kws_resume_host
-        self._kws_resume_port = (
-            kws_resume_port
-            if kws_resume_port is not None
-            else self._config.session.kws_resume_port
-        )
         self._room_name = room_name or (
             "%s_%d" % (self._config.session.room_name_prefix, int(time.time() * 1000))
         )
@@ -360,13 +338,6 @@ class KwsLiveKitClient:
             if data.data == b"session_end":
                 print("%s 收到休眠信号" % _ts())
                 self._sleep_speech_state["session_end"] = True
-                asyncio.create_task(
-                    asyncio.to_thread(
-                        _send_resume_to_kws,
-                        self._kws_resume_host,
-                        self._kws_resume_port,
-                    )
-                )
                 self._disconnect_after_audio = True
                 self._session_end_time = time.monotonic()
 
@@ -472,17 +443,18 @@ class KwsLiveKitClient:
 async def run_client(
     keyword: str = "",
     *,
-    kws_resume_host: Optional[str] = None,
-    kws_resume_port: Optional[int] = None,
     room_name: Optional[str] = None,
+    livekit_url: str = "ws://127.0.0.1:7880",
+    livekit_api_key: str = "devkey",
+    livekit_api_secret: str = "secret",
     apm_echo_cancellation: bool = False,
     apm_noise_suppression: bool = False,
     apm_high_pass_filter: bool = False,
     apm_auto_gain_control: bool = False,
 ) -> None:
     """
-    便捷入口：创建 KwsLiveKitClient 并运行。供 kws_wake_listener 调用。
-    若需 AEC，设置 apm_echo_cancellation=True；会同时在播放回调中喂 process_reverse_stream 并设置 stream_delay_ms。
+    便捷入口：创建 KwsLiveKitClient 并运行。供 robot_kws_main 直接 await 调用。
+    若需 AEC，设置 apm_echo_cancellation=True。
     """
     config = KwsClientConfig(
         apm=APMConfig(
@@ -490,13 +462,14 @@ async def run_client(
             noise_suppression=apm_noise_suppression,
             high_pass_filter=apm_high_pass_filter,
             auto_gain_control=apm_auto_gain_control,
-        )
+        ),
+        livekit_url=livekit_url,
+        livekit_api_key=livekit_api_key,
+        livekit_api_secret=livekit_api_secret,
     )
     client = KwsLiveKitClient(
         config,
         keyword=keyword,
-        kws_resume_host=kws_resume_host,
-        kws_resume_port=kws_resume_port,
         room_name=room_name,
     )
     await client.run()

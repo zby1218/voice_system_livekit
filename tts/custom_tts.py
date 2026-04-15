@@ -4,6 +4,7 @@ import asyncio
 import os
 import re
 import socket
+from datetime import datetime
 from dataclasses import dataclass, replace
 from typing import Callable, Optional, Literal, Tuple, Dict, Any, List
 
@@ -97,6 +98,7 @@ class CosyVoiceTTS(tts.TTS):
         client: Optional[httpx.AsyncClient] = None,
         on_first_frame_pushed: Optional[Callable[[], None]] = None,
         on_tts_request_sent: Optional[Callable[[], None]] = None,
+        on_first_segment_ready: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=False),
@@ -131,6 +133,7 @@ class CosyVoiceTTS(tts.TTS):
         self._prompt_cache: Optional[bytes] = None
         self._on_first_frame_pushed = on_first_frame_pushed  # TTS 首帧 push 时回调，用于 E2E 终点
         self._on_tts_request_sent = on_tts_request_sent  # 向 TTS server 发送请求前回调，用于计时「请求→首帧」
+        self._on_first_segment_ready = on_first_segment_ready  # 首句段就绪并发送到TTS前回调
 
         self._client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(
@@ -285,6 +288,9 @@ class CosyVoiceChunkedStream(tts.ChunkedStream):
         merged = self._merge_short(packed)
         return [self._ensure_ending_punct(x.strip()) for x in merged if x.strip()]
 
+    def _hms_ms(self) -> str:
+        return datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
     def _silence_bytes(self, ms: int) -> bytes:
         if ms <= 0:
             return b""
@@ -364,6 +370,8 @@ class CosyVoiceChunkedStream(tts.ChunkedStream):
             loop = asyncio.get_event_loop()
             start_ts = loop.time()
             e2e_end_recorded = False  # 整轮只记一次首帧（第一段的首帧）
+            _push_count = 0
+            _push_start = loop.time()
 
             total_deadline = float(getattr(self._conn_options, "timeout", self._opts.total_timeout_s))
 
@@ -372,6 +380,12 @@ class CosyVoiceChunkedStream(tts.ChunkedStream):
                     if total_deadline and (loop.time() - start_ts) > total_deadline:
                         raise APITimeoutError() from None
 
+                    print(
+                        f"[TIMING] {self._hms_ms()} 📝 句段就绪并发送到TTS "
+                        f"seg={idx} text='{seg}'"
+                    )
+                    if idx == 0 and self._tts._on_first_segment_ready:
+                        self._tts._on_first_segment_ready()
                     url, data, files = self._build_request_for_segment(seg)
                     candidates = (url, url + "/")  # 兼容尾部 /
 
@@ -414,6 +428,12 @@ class CosyVoiceChunkedStream(tts.ChunkedStream):
 
                                 if first:
                                     output_emitter.push(first)
+                                    _push_count += 1
+                                    print(
+                                        f"[TIMING] {self._hms_ms()} ⬆️  [SERVER] 首帧推入输出emitter "
+                                        f"seg={idx} size={len(first)}B elapsed={loop.time()-_push_start:.3f}s",
+                                        flush=True,
+                                    )
                                     if self._tts._on_first_frame_pushed and not e2e_end_recorded:
                                         self._tts._on_first_frame_pushed()
                                         e2e_end_recorded = True
@@ -430,8 +450,8 @@ class CosyVoiceChunkedStream(tts.ChunkedStream):
                                     except StopAsyncIteration:
                                         break
                                     if chunk:
-                                        # _logger.info(f"🎵 [CosyVoiceTTS] 推送 {len(chunk)} 字节")
                                         output_emitter.push(chunk)
+                                        _push_count += 1
 
                             ok = True
                             break

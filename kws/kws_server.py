@@ -24,7 +24,7 @@ from websockets.server import serve
 class KWSConfig:
     """KWS 服务配置：路径、音频参数、网络与推理常量。"""
     model_dir: str
-    keywords: str = "小莫小莫,你好小莫"
+    keywords: str = "你好锐博"
     threshold: float = 0.4
     host: str = "0.0.0.0"
     port: int = 8765
@@ -39,7 +39,7 @@ class KWSConfig:
 
     @property
     def weight_path(self) -> str:
-        return os.path.join(self.model_dir, "model_weight", "model.pt.avg10")
+        return os.path.join(self.model_dir, "model_weight", "ruibo.avg10")
 
     @property
     def token_list(self) -> str:
@@ -120,7 +120,7 @@ class KWSWebSocketServer:
     def __init__(
         self,
         model_dir: str = "./model",
-        keywords: str = "小莫小莫,你好小莫",
+        keywords: str = "你好锐博",
         threshold: float = 0.4,
         host: str = "0.0.0.0",
         port: int = 8765,
@@ -367,9 +367,9 @@ def main():
     parser = argparse.ArgumentParser(description="WebSocket 唤醒词检测服务")
     parser.add_argument("--model_dir", type=str, default=default_model_dir, 
                         help="模型路径")
-    parser.add_argument("--keywords", type=str, default="小莫小莫,你好小莫", 
+    parser.add_argument("--keywords", type=str, default="你好锐博", 
                         help="唤醒词,用逗号分隔")
-    parser.add_argument("--threshold", type=float, default=0.2, 
+    parser.add_argument("--threshold", type=float, default=0.4, 
                         help="唤醒阈值 (0.0-1.0)")
     parser.add_argument("--host", type=str, default="0.0.0.0", 
                         help="服务器地址")

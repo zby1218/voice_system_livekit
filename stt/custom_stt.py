@@ -10,6 +10,7 @@ from typing import Any, Callable, Optional, List
 import logging
 
 import aiohttp
+from datetime import datetime
 from livekit import rtc
 from livekit.agents import (
     DEFAULT_API_CONNECT_OPTIONS,
@@ -22,6 +23,10 @@ from livekit.agents import (
 )
 from livekit.agents.metrics import STTMetrics
 from livekit.agents.metrics.base import Metadata
+
+
+def _ts() -> str:
+    return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 # ===== FunASR 常用输入参数 =====
 SAMPLE_RATE = 16000
@@ -425,6 +430,7 @@ class SpeechStream(stt.SpeechStream):
                         self._inference_start_at = time.time()
                         if self._on_segment_submitted:
                             self._on_segment_submitted()
+                        print(f"[TIMING] {_ts()} ② STT 收到 FlushSentinel，发送 is_speaking=False 给 FunASR（2nd pass 开始）", flush=True)
                         await ws.send_str(json.dumps({"is_speaking": False}))
                         self._speaking = False
 
@@ -502,6 +508,7 @@ class SpeechStream(stt.SpeechStream):
                 else:
                     # final：用服务端给的 transcript（通常更干净）
                     current_text = ""
+                    print(f"[TIMING] {_ts()} ★ FunASR 2nd pass 完成，FINAL_TRANSCRIPT='{text[:40]}'", flush=True)
                     self._event_ch.send_nowait(
                         stt.SpeechEvent(
                             type=stt.SpeechEventType.FINAL_TRANSCRIPT,

@@ -6,6 +6,7 @@ import re
 import sys
 import json
 import time
+import wave
 import asyncio
 import logging
 import traceback
@@ -15,10 +16,23 @@ import numpy as np
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional
 
 # 忽略警告
 warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------------------------
+# 音频尾部能量过滤模块
+#   来源：stt/audio_energy_filter.py（同目录独立模块，不耦合服务逻辑）
+#   配套调参工具：record_analysis/compare_voice_filter.py
+#     用法：python compare_voice_filter.py low_voice.wav norm_voice.wav
+#           可在新样本上验证阈值，输出建议值和间隙倍数
+# ---------------------------------------------------------------------------
+_stt_dir = os.path.dirname(os.path.abspath(__file__))
+if _stt_dir not in sys.path:
+    sys.path.insert(0, _stt_dir)
+from audio_energy_filter import TailEnergyConfig, is_low_energy  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -49,15 +63,24 @@ ENABLE_SPEAKER_SELECT: bool = False
 # speaker 服务地址（需先在本机启动：python -m speaker_select.server）
 SPEAKER_SERVICE_URL: str = "http://127.0.0.1:1999/separate"
 
+# 音频录制开关：True 时将每次推理的音频段保存为 WAV，并将识别结果保存为同名 TXT；False 则不记录任何内容
+ENABLE_AUDIO_RECORD: bool = True
+
 
 @dataclass(frozen=True)
 class ASRServerConfig:
     """ASR 服务配置，集中管理常量和可调参数。"""
     sample_rate: int = 16000
     min_duration_sec: float = 0.5
-    energy_threshold: float = 50.0
+
+    # 音频尾部能量过滤配置（详见 stt/audio_energy_filter.py）
+    #   原理：端点检测截取的音频 = 前段静音 + 尾部语音，直接分析尾部绕开静音稀释
+    #   调参：运行 record_analysis/compare_voice_filter.py 在新样本上验证阈值
+    tail_energy: TailEnergyConfig = field(default_factory=TailEnergyConfig)
+
     inference_workers: int = 5
-    default_hotwords: list = field(default_factory=lambda: ["天工", "小莫", "一汽"])
+    default_hotwords: list = field(default_factory=lambda: ["天工", "小莫", "一汽", "零五", "零七", "EH", "爱心发射", "优雅邀舞", "我中有你", "力量展示", "大赞天工", "复位", "许万才", "邱现东","刘亦功","吴国峰","梁贵友","孙继光","方世力","吴碧磊","陈彬","高璞","张小帆", "锐博"])
+
     model_subdir: str = "FunAudioLLM/Fun-ASR-Nano-2512"
     # 文本过滤：单字符重复次数阈值（>=N 视为幻觉）
     single_char_repeat_min: int = 4
@@ -70,12 +93,15 @@ class ASRServerConfig:
 # ---------------------------------------------------------------------------
 
 class AudioFilter:
-    """对即将送入 ASR 的音频做前置过滤，过短或过静则跳过推理。"""
+    """对即将送入 ASR 的音频做前置过滤，过短或过静则跳过推理。
+
+    能量过滤委托给 audio_energy_filter.is_low_energy()，
+    该函数基于「尾部分析」策略，对含长段前置静音的音频具有鲁棒性。
+    """
 
     def __init__(self, config: ASRServerConfig, logger: logging.Logger):
         self._config = config
         self._logger = logger
-        # 低于0.5秒的音频不进行推理
         self._min_bytes = int(config.sample_rate * config.min_duration_sec) * 2
 
     def should_skip(
@@ -86,7 +112,7 @@ class AudioFilter:
     ) -> tuple[bool, str]:
         """
         判断是否应跳过本次推理。
-        :param logger: 若提供则用其写跳过原因（便于按连接落盘）；否则用 self._logger。
+        :param logger:    若提供则用其写跳过原因（便于按连接落盘）；否则用 self._logger。
         :param client_id: 连接标识，写入日志前缀，便于多客户端追踪。
         :return: (是否跳过, 原因描述)，不跳过时原因为空字符串。
         """
@@ -98,18 +124,17 @@ class AudioFilter:
 
         if len(audio_bytes) < self._min_bytes:
             log.info(
-                "%s音频过短 (%s bytes < %s bytes)，跳过推理",
+                "%s音频过短 (%d bytes < %d bytes)，跳过推理",
                 prefix, len(audio_bytes), self._min_bytes,
             )
             return True, "过短"
 
-        data_int16 = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
-        rms = float(np.sqrt(np.mean(data_int16 ** 2)))
-        if rms < self._config.energy_threshold:
-            log.info(
-                "%s音频能量过低 (RMS=%.1f < %s)，跳过推理",
-                prefix, rms, self._config.energy_threshold,
-            )
+        # 尾部能量过滤：分析音频末尾 tail_sec 秒，判断触发端点的语音是否够响
+        # 详细逻辑见 stt/audio_energy_filter.py；阈值调整使用配套工具：
+        #   record_analysis/compare_voice_filter.py
+        low_energy, reason = is_low_energy(audio_bytes, self._config.tail_energy)
+        if low_energy:
+            log.info("%s音频尾部能量过低 (%s)，跳过推理", prefix, reason)
             return True, "能量过低"
 
         return False, ""
@@ -195,6 +220,73 @@ class TextFilter:
 
 
 # ---------------------------------------------------------------------------
+# 音频录制（保存每次推理的原始音频段）
+# ---------------------------------------------------------------------------
+
+class AudioRecorder:
+    """将每次送入 STT 推理的音频段持久化为 WAV 文件。
+
+    文件保存在 <record_dir>/<YYYYMMDD_HHMMSS_ffffff>.wav，
+    其中时间戳精确到微秒，可区分高并发场景下同一秒内的多次推理。
+
+    参数
+    ----
+    record_dir : str
+        录音文件根目录（不存在时自动创建）。
+    sample_rate : int
+        采样率，默认 16000 Hz。
+    enabled : bool
+        为 False 时 save() 为空操作，方便在配置层面开关。
+    """
+
+    def __init__(
+        self,
+        record_dir: str,
+        sample_rate: int = 16000,
+        enabled: bool = True,
+    ) -> None:
+        self._record_dir = record_dir
+        self._sample_rate = sample_rate
+        self._enabled = enabled
+        self._logger = logging.getLogger("AudioRecorder")
+        if enabled:
+            os.makedirs(record_dir, exist_ok=True)
+            self._logger.info("音频录制已启用，保存目录: %s", record_dir)
+
+    def save(self, audio_bytes: bytes, text: str = "", client_id: str = "") -> Optional[str]:
+        """将 PCM s16le 字节流保存为 WAV 文件，并将识别结果保存为同名 TXT 文件。
+
+        :param audio_bytes: 原始 PCM 16-bit 小端单声道字节流。
+        :param text:        本次推理的识别结果文本，保存到同名 .txt 文件。
+        :param client_id:   连接标识，写入日志前缀便于追踪。
+        :return:            成功时返回 WAV 文件路径（不含扩展名前缀），失败或禁用时返回 None。
+        """
+        if not self._enabled:
+            return None
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            stem = os.path.join(self._record_dir, timestamp)
+            wav_path = f"{stem}.wav"
+            txt_path = f"{stem}.txt"
+            with wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)          # 16-bit = 2 bytes
+                wf.setframerate(self._sample_rate)
+                wf.writeframes(audio_bytes)
+            with open(txt_path, "w", encoding="utf-8") as tf:
+                tf.write(text)
+            prefix = f"[{client_id}] " if client_id else ""
+            self._logger.info(
+                "%s音频段已保存: %s (%d bytes)，识别结果: %r",
+                prefix, wav_path, len(audio_bytes), text,
+            )
+            return stem
+        except Exception as e:
+            self._logger.warning("[%s] 保存音频段失败: %s", client_id, e)
+            return None
+
+
+# ---------------------------------------------------------------------------
 # WebSocket 会话状态
 # ---------------------------------------------------------------------------
 
@@ -267,6 +359,11 @@ class ASRServer:
         self._text_filter = TextFilter(
             single_char_repeat_min=self._config.single_char_repeat_min,
             phrase_repeat_min=self._config.phrase_repeat_min,
+        )
+        self._audio_recorder = AudioRecorder(
+            record_dir=os.path.join(self._stt_log_dir, "record"),
+            sample_rate=self._config.sample_rate,
+            enabled=ENABLE_AUDIO_RECORD,
         )
 
     def _check_path(self, path: str, name: str) -> None:
@@ -378,12 +475,13 @@ class ASRServer:
 
         try:
             async for message in websocket:
+                # client传递配置进行解析
                 if isinstance(message, str):
                     await self._handle_text_message(websocket, session, message, frames_asr, client_id)
                 else:
+                # client传递音频帧进行推理
                     frames_asr.append(message)
-                    if len(frames_asr) == 1:
-                        self._logger.info("[%s] 开始接收音频帧", client_id)
+
         except websockets.ConnectionClosed:
             client_logger.info("[%s] 客户端断开连接", client_id)
             self._logger.info("[%s] 客户端断开连接", client_id)
@@ -501,7 +599,6 @@ class ASRServer:
             await self._send_empty_final(websocket)
             return
 
-
         try:
             audio_tensor = self._decode_audio_chunk(audio_in)
             res = await self._run_model_inference(
@@ -520,6 +617,8 @@ class ASRServer:
                 self._logger.info("[%s] 过滤幻觉文本 (%s): %r", client_id, reason, text)
                 await self._send_empty_final(websocket)
                 return
+
+            self._audio_recorder.save(audio_in, text=text, client_id=client_id)
 
             log.info("[%s] Final Result: %s", client_id, text)
             self._logger.info("[%s] Final Result: %s", client_id, text)

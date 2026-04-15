@@ -53,67 +53,40 @@ git lfs pull
 
 ## Docker 部署（快速迁移到新机器）
 
-对于展示机或 5090 机器，推荐用 Docker 镜像实现环境零配置迁移。
+**代码是否已经在镜像里？** 是的。`Dockerfile` 里已通过 `COPY` 把 `voice_system_livekit/` 与 `answerAgent/fawtd_agent/` 打进镜像；演示机**不需要**再挂一份源码目录来跑服务。之前单独挂载模型，只是为了**减小镜像体积**、方便只更新权重。
 
-### 工作流
+构建上下文必须是 **`voice_system_livekit` 的上一级目录**（例如 `project/`，其中并列存在 `voice_system_livekit` 与 `answerAgent/fawtd_agent`）。Docker 只认该目录下的 `.dockerignore`：本仓库用 `scripts/ensure_dockerignore.sh` 在构建前把 `docker/context-project*.dockerignore` 复制为 `project/.dockerignore`，避免误用子目录里的占位说明。
+
+### 两种部署方式
+
+| 方式 | 构建命令 | 演示机启动 | 说明 |
+|------|----------|------------|------|
+| **精简镜像 + 宿主机挂模型** | `bash scripts/build_and_export.sh` | `bash scripts/deploy.sh --load …/voice-system.tar.gz` | 镜像约 15～20GB；演示机需准备 `/data/models/…`（见 `docker-compose.yml`） |
+| **全量镜像（最省事）** | `BUNDLE_MODELS=1 bash scripts/build_and_export.sh` | `bash scripts/deploy.sh --embedded --load …/voice-system.tar.gz` | 镜像含本地已有的大权重，体积可达数十 GB；演示机**不必**再 rsync 模型 |
+
+全量模式会把你开发机 `project/` 里**已经存在**的模型目录一并 `COPY` 进镜像（前提是未被 `docker/context-project-bundle.dockerignore` 排除）。若某路径在本机为空，镜像里同样为空。
+
+### 工作流（精简镜像）
 
 ```
 开发机                          演示机
 ------                          ------
-1. git clone + 准备好所有模型
-2. bash scripts/build_and_export.sh
-   → /tmp/voice-system.tar.gz
-3. scp /tmp/voice-system.tar.gz  →  演示机:/tmp/
-                                 4. bash scripts/deploy.sh --load /tmp/voice-system.tar.gz
-                                    → 导入镜像 + 检查模型目录 + docker compose up -d
+1. 并列放好 voice_system_livekit + answerAgent/fawtd_agent
+2. bash scripts/build_and_export.sh → /tmp/voice-system.tar.gz
+3. rsync 模型到演示机 /data/models/…
+4. scp 镜像 tar 到演示机
+                                 5. 浅克隆仓库（只要 compose + 脚本）
+                                 6. bash scripts/deploy.sh --load /tmp/voice-system.tar.gz
 ```
 
-### 第一步：开发机打包镜像
+### 工作流（全量镜像）
 
-```bash
-# 在 voice_system_livekit/ 目录下
-bash scripts/build_and_export.sh
-# 输出：/tmp/voice-system.tar.gz（约 15~20 GB）
+```
+开发机：BUNDLE_MODELS=1 bash scripts/build_and_export.sh
+演示机：scp 大 tar → bash scripts/deploy.sh --embedded --load …
 ```
 
-### 第二步：传输模型文件
-
-模型文件体积较大，不打进镜像，需要单独传输。建议用 `rsync`：
-
-```bash
-# TTS 模型（~2GB）
-rsync -avz --progress tts/model/Fun-CosyVoice3-0.5B/ user@demo:/data/models/Fun-CosyVoice3-0.5B/
-# STT 模型
-rsync -avz --progress stt/model/ user@demo:/data/models/stt/
-# vLLM 模型（~16GB，Qwen3-8B）
-rsync -avz --progress /path/to/Qwen3-8B/ user@demo:/data/models/Qwen3-8B/
-# Embedding 模型（BAAI/bge-small-zh-v1.5）
-rsync -avz --progress ~/.cache/huggingface/hub/ user@demo:/data/models/hub/
-# TTS 音色 WAV
-rsync -avz --progress tts/assets/ user@demo:/data/tts_assets/
-```
-
-### 第三步：演示机启动
-
-```bash
-# 克隆代码（只需代码，不需要模型）
-git clone git@github.com:zby1218/voice_system_livekit.git
-cd voice_system_livekit
-
-# 导入并启动（自动检查模型目录）
-bash scripts/deploy.sh --load /tmp/voice-system.tar.gz
-
-# 查看日志
-docker logs -f voice-system
-```
-
-如果模型不在默认的 `/data/models/` 路径下，可通过环境变量覆盖：
-
-```bash
-TTS_MODEL_DIR=/your/path/Fun-CosyVoice3-0.5B \
-VLLM_MODEL_DIR=/your/path/Qwen3-8B \
-bash scripts/deploy.sh --load /tmp/voice-system.tar.gz
-```
+演示机仍需本仓库中的 `docker-compose.embedded.yml` 与 `scripts/deploy.sh`（可用 `git clone --depth 1`）；**不必**再在宿主机准备模型目录。
 
 ### 演示机前置条件
 
@@ -122,3 +95,13 @@ bash scripts/deploy.sh --load /tmp/voice-system.tar.gz
 | Docker Engine | `curl -fsSL https://get.docker.com \| sh` |
 | docker-compose-plugin | `apt install docker-compose-plugin` |
 | NVIDIA Container Toolkit | [官方文档](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) |
+
+### 宿主机模型路径（仅精简模式）
+
+若使用默认 `docker-compose.yml`，可用 `rsync` 将模型同步到演示机，或通过环境变量覆盖挂载路径，例如：
+
+```bash
+TTS_MODEL_DIR=/your/path/Fun-CosyVoice3-0.5B \
+VLLM_MODEL_DIR=/your/path/Qwen3-8B \
+bash scripts/deploy.sh --load /tmp/voice-system.tar.gz
+```

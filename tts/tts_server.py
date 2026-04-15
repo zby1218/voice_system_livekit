@@ -6,12 +6,14 @@
 """
 
 import os
+import re
 import sys
 import time
 import logging
 import argparse
 import threading
 import asyncio
+from datetime import datetime
 from typing import Generator, Dict, Any, Optional, Literal
 
 # 路径设置（必须在导入同目录模块之前）
@@ -43,7 +45,7 @@ def _setup_logging() -> None:
     log_path = os.path.join(log_dir, "tts.log")
 
     fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        "%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -65,16 +67,32 @@ def _setup_logging() -> None:
     tts_logger.info("TTS 日志文件: %s", os.path.abspath(log_path))
     file_handler.flush()
 
+    # 屏蔽 python-multipart 的 DEBUG 日志（FastAPI multipart/form-data 解析噪音）
+    logging.getLogger("multipart").setLevel(logging.WARNING)
+    logging.getLogger("multipart.multipart").setLevel(logging.WARNING)
+
 
 # 使用固定名称，避免以脚本运行时显示为 __main__
 logger = logging.getLogger("tts_server")
 
 # ========== 音色配置 ==========
 VOICE_CONFIGS = [
-    {"id": "default", "file": "robot.wav",
+    {"id": "default", "file": "robot_bazong_cold.wav",
+    "prompt_text": "You are a helpful assistant.用平静沉稳的语气，正常的语速来回答<|endofprompt|>一个人呆久了，突然和你聊聊天，倒也不觉得那么无聊了"},
+    {"id": "longanyun", "file": "longanyun.wav",
+    "prompt_text": "You are a helpful assistant.用平静沉稳的语气，正常的语速来回答<|endofprompt|>您已经辛苦一天了，我已经为您调整好室内温度，还准备了您喜欢的饮品，您可以放松休息一下，有任何需要，都可以叫我哦。"},
+    {"id": "longtian", "file": "longtian.wav",
+    "prompt_text": "You are a helpful assistant.用平静沉稳的语气，正常的语速来回答<|endofprompt|>没必要为不值得的人费时间，想开点，生活还得继续，先做再说，别光想着做，等啥时候。"},
+    {"id": "longhao", "file": "longhao.wav",
+    "prompt_text": "You are a helpful assistant.用平静沉稳的语气，正常的语速来回答<|endofprompt|>唉，时间过的可真快，一晃眼，曾经说好要互相照顾的人，都像是被风吹走的蒲公英，一个不留意就走丢了。"},
+    {"id": "muju", "file": "muju.wav",
+    "prompt_text": "You are a helpful assistant.用平静沉稳的语气，正常的语速来回答<|endofprompt|>首发的一汽世界模型，是认知的觉醒，也是行动的序章"},
+    {"id": "robot_bazong", "file": "robot_bazong.wav",
+    "prompt_text": "You are a helpful assistant.<|endofprompt|>别老盯着我看，有话直说，我可不喜欢猜别人心思"},
+    {"id": "robot", "file": "robot.wav",
     "prompt_text": "You are a helpful assistant.用最大的音量来回答<|endofprompt|>大家好，我来自一汽机器人"},
     {"id": "longanhuan", "file": "zero_shot_prompt.wav",
-     "prompt_text": "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。"},
+     "prompt_text": "You are a helpful assistant.用正常的语速和语调以及情绪来回答<|endofprompt|>希望你以后能够做的比我还好呦。"},
     
 ]
 
@@ -115,6 +133,17 @@ def _configure_cuda_environment(device: str) -> str:
     return "cuda"
 
 
+# 送入合成模型前：去掉夹在 ASCII 字母/数字之间的连字符（如 E-H7、A-B-12 -> EH7、AB12），避免 TTS 把「杠」读出来。
+_TTS_ALNUM_BOUNDED_HYPHEN = re.compile(r"(?<=[A-Za-z0-9])-(?=[A-Za-z0-9])")
+
+
+def filter_tts_synth_text(text: str) -> str:
+    """对整段待合成文本做规整，可安全多次调用。"""
+    if not text:
+        return text
+    return _TTS_ALNUM_BOUNDED_HYPHEN.sub("", text)
+
+
 # ========== 音频后处理 ==========
 
 _AUDIO_GAIN: float = 2.0  # 响度增益倍数，1.0 = 不变
@@ -136,7 +165,8 @@ class TTSEngine:
     
     def __init__(self, model_dir: str, asset_dir: str, device: str = "cuda",
                  fp16: bool = True, use_vllm: bool = False,
-                 output_sample_rate: int = 24000, max_concurrent: int = 2, logger=None):
+                 output_sample_rate: int = 24000, max_concurrent: int = 2,
+                 default_voice: str = "default", logger=None):
         self.model_dir = model_dir
         self.asset_dir = asset_dir
         self.device = device
@@ -144,6 +174,7 @@ class TTSEngine:
         self.use_vllm = use_vllm
         self.output_sample_rate = output_sample_rate
         self.max_concurrent = max_concurrent
+        self.default_voice = default_voice
         self.logger = logger or logging.getLogger(__name__)
         
         self.cosyvoice = None
@@ -189,17 +220,34 @@ class TTSEngine:
                 self.logger.info(f"✅ 音色: {cfg['id']}")
             except Exception as e:
                 self.logger.warning(f"音色加载失败 {cfg['id']}: {e}")
-        
-        # 预热
-        if self.voice_cache:
-            vid = list(self.voice_cache.keys())[0]
+
+        # 确定实际默认音色：优先命令行指定，不在缓存则回退到第一个可用
+        if self.default_voice in self.voice_cache:
+            effective_default = self.default_voice
+        elif self.voice_cache:
+            effective_default = list(self.voice_cache.keys())[0]
+            self.logger.warning(
+                f"⚠️ 指定音色 '{self.default_voice}' 未加载，实际默认音色回退为: '{effective_default}'"
+            )
+        else:
+            effective_default = None
+
+        if effective_default:
+            self.logger.info(f"🎙️ 当前默认音色: {effective_default}")
+
+        # 仅用默认音色预热一次（激活 CUDA kernel 和显存分配，与具体音色无关）
+        if effective_default:
+            vid = effective_default
             try:
-                for _ in self.cosyvoice.inference_zero_shot("预热", self.voice_cache[vid]["prompt_text"],
-                                                            self.voice_cache[vid]["file"], stream=False, zero_shot_spk_id=vid):
+                self.logger.info(f"预热中（音色: {vid}）...")
+                for _ in self.cosyvoice.inference_zero_shot(
+                    "预热", self.voice_cache[vid]["prompt_text"],
+                    self.voice_cache[vid]["file"], stream=False, zero_shot_spk_id=vid
+                ):
                     pass
-                self.logger.info("预热完成")
-            except:
-                pass
+                self.logger.info(f"✅ 预热完成（音色: {vid}）")
+            except Exception as e:
+                self.logger.warning(f"预热失败（音色: {vid}）: {e}")
         
         self.loaded = True
     
@@ -315,14 +363,23 @@ class TTSEngine:
         interrupt_mode: InterruptMode = "normal",
     ) -> Generator[bytes, None, None]:
         """流式合成 - 返回 PCM 字节流（支持并发）"""
+        text = filter_tts_synth_text(text)
         if not self.loaded or not text.strip():
             return
         
-        vid = voice_id if voice_id in self.voice_cache else "default"
-        if vid not in self.voice_cache:
-            vid = list(self.voice_cache.keys())[0] if self.voice_cache else None
-        if not vid:
+        requested = voice_id or "default"
+        if requested in self.voice_cache:
+            vid = requested
+        elif "default" in self.voice_cache:
+            vid = "default"
+            if requested != "default":
+                self.logger.warning(f"音色 '{requested}' 不存在，回退为 'default'")
+        elif self.voice_cache:
+            vid = list(self.voice_cache.keys())[0]
+            self.logger.warning(f"音色 '{requested}' 及 'default' 均不存在，回退为 '{vid}'")
+        else:
             raise ValueError("无可用音色")
+        self.logger.debug(f"🎙️ 使用音色: {vid}")
         
         voice = self.voice_cache[vid]
         request_id = self._register_request(session_id, interrupt_mode)
@@ -332,6 +389,12 @@ class TTSEngine:
         try:
             self._acquire_slot(request_id)
             acquired = True
+            self.logger.info(
+                "[TIMING] %s 🎙️ 开始生成音频流 request_id=%s text='%s'",
+                datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                request_id,
+                text,
+            )
             first_chunk = True
             for result in self.cosyvoice.inference_zero_shot(
                 text, voice["prompt_text"], voice["file"], stream=True, zero_shot_spk_id=vid
@@ -374,6 +437,7 @@ class TTSEngine:
         interrupt_mode: InterruptMode = "normal",
     ) -> Generator[bytes, None, None]:
         """零样本合成 - 优先使用预注册音色（支持并发）"""
+        text = filter_tts_synth_text(text)
         if not self.loaded or not text.strip():
             return
         
@@ -394,6 +458,12 @@ class TTSEngine:
             try:
                 self._acquire_slot(request_id)
                 acquired = True
+                self.logger.info(
+                    "[TIMING] %s 🎙️ 开始生成音频流 request_id=%s text='%s'",
+                    datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                    request_id,
+                    text,
+                )
                 first_chunk = True
                 for result in self.cosyvoice.inference_zero_shot(
                     text, voice["prompt_text"], voice["file"], stream=True, zero_shot_spk_id=matched_voice_id
@@ -433,6 +503,12 @@ class TTSEngine:
             try:
                 self._acquire_slot(request_id)
                 acquired = True
+                self.logger.info(
+                    "[TIMING] %s 🎙️ 开始生成音频流 request_id=%s text='%s'",
+                    datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                    request_id,
+                    text,
+                )
                 first_chunk = True
                 for result in self.cosyvoice.inference_zero_shot(text, prompt_text, temp_path, stream=True):
                     if self._request_control.is_cancelled(request_id):
@@ -507,15 +583,20 @@ async def inference_sft(
     
     def gen():
         first = True
+        chunk_idx = 0
+        t0 = time.time()
         for chunk in tts_engine.synthesize(
             tts_text,
             voice_id=spk_id,
             session_id=session,
             interrupt_mode=mode,
         ):
+            now = time.time()
             if first:
-                logger.info(f"[SFT] ⏱️ 首包延迟: {time.time() - start_time:.3f}s")
+                logger.info(f"[SFT] ⏱️ 首包延迟: {now - start_time:.3f}s")
                 first = False
+            logger.info(f"[SFT-CHUNK] #{chunk_idx} size={len(chunk)}B elapsed={now - t0:.3f}s ts={now:.3f}")
+            chunk_idx += 1
             yield chunk
     
     return StreamingResponse(gen(), media_type="application/octet-stream",
@@ -548,6 +629,8 @@ async def inference_zero_shot(
     
     def gen():
         first = True
+        chunk_idx = 0
+        t0 = time.time()
         for chunk in tts_engine.synthesize_zero_shot(
             tts_text,
             prompt_text,
@@ -555,9 +638,12 @@ async def inference_zero_shot(
             session_id=session,
             interrupt_mode=mode,
         ):
+            now = time.time()
             if first:
-                logger.info(f"[ZeroShot] ⏱️ 首包延迟: {time.time() - start_time:.3f}s")
+                logger.info(f"[ZeroShot] ⏱️ 首包延迟: {now - start_time:.3f}s")
                 first = False
+            logger.info(f"[ZeroShot-CHUNK] #{chunk_idx} size={len(chunk)}B elapsed={now - t0:.3f}s ts={now:.3f}")
+            chunk_idx += 1
             yield chunk
     
     return StreamingResponse(gen(), media_type="application/octet-stream",
@@ -585,15 +671,20 @@ async def tts_stream(
     
     def gen():
         first = True
+        chunk_idx = 0
+        t0 = time.time()
         for chunk in tts_engine.synthesize(
             text,
             voice_id=voice_id,
             session_id=session,
             interrupt_mode=mode,
         ):
+            now = time.time()
             if first:
-                logger.info(f"[TTS] ⏱️ 首包延迟: {time.time() - start_time:.3f}s")
+                logger.info(f"[TTS] ⏱️ 首包延迟: {now - start_time:.3f}s")
                 first = False
+            logger.info(f"[TTS-CHUNK] #{chunk_idx} size={len(chunk)}B elapsed={now - t0:.3f}s ts={now:.3f}")
+            chunk_idx += 1
             yield chunk
     
     return StreamingResponse(gen(), media_type="application/octet-stream",
@@ -630,6 +721,8 @@ def main():
     parser.add_argument("--vllm", action="store_true", default=False, help="使用 vLLM")
     parser.add_argument("--sample-rate", type=int, default=24000, help="输出采样率")
     parser.add_argument("--max-concurrent", type=int, default=2, help="最大并发请求数")
+    parser.add_argument("--voice", type=str, default="default",
+                        help="默认音色 id，对应 VOICE_CONFIGS（默认: default）")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="监听地址")
     parser.add_argument("--port", type=int, default=50000, help="监听端口")
     
@@ -654,6 +747,7 @@ def main():
     logger.info(f"  设备: {args.device}, FP16: {args.fp16}")
     logger.info(f"  采样率: {args.sample_rate}")
     logger.info(f"  最大并发: {args.max_concurrent}")
+    logger.info(f"  默认音色: {args.voice}")
     logger.info(f"  监听: {args.host}:{args.port}")
     logger.info("=" * 60)
     
@@ -666,12 +760,13 @@ def main():
         use_vllm=args.vllm,
         output_sample_rate=args.sample_rate,
         max_concurrent=args.max_concurrent,
+        default_voice=args.voice,
         logger=logger
     )
     tts_engine.load_model()
     
     # 启动服务
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(app, host=args.host, port=args.port, log_config=None)
 
 
 # 模块加载时即配置日志（python tts_server.py 或 uvicorn tts_server:app 都会执行），日志文件在项目根 log/tts/tts.log

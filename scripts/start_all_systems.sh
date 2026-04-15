@@ -5,12 +5,12 @@
 # 2. conda voice_system -> kws/kws_server.py
 # 3. conda voice_system -> stt/stt_server_novad.py
 # 4. conda voice_system -> tts/tts_server.py
-# 5. conda fawbot-agent -> answerAgent/fawtd_agent/scripts/start_services.py --vllm
-# 6. conda fawbot-agent -> answerAgent/fawtd_agent/robot_api_server.py
-# 7. conda livekit -> server/stt_llm_agent.py start
+# 5. conda fawbot-agent -> fawbot_0410/fawtd_robot/scripts/start_services.py --all
+#    （含 vLLM、MCP、API Server，就绪后自动退出）
+# 6. conda livekit -> server/stt_llm_agent.py start
 #
-# 覆盖 Fawbot 目录（若实际文件夹名不同）:
-#   export FAWBOT_AGENT_DIR=/path/to/your/agent
+# 覆盖 Fawbot 目录（若实际路径不同）:
+#   export FAWBOT_AGENT_DIR=/path/to/your/fawbot_0410/fawtd_robot
 #
 # 停止：Ctrl+C（会尝试优雅结束本脚本拉起的子进程）。
 #
@@ -21,8 +21,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VOICE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PROJECT_ROOT="$(dirname "$VOICE_ROOT")"
-FAWBOT_AGENT_DIR="${FAWBOT_AGENT_DIR:-$PROJECT_ROOT/answerAgent/fawtd_agent}"
+FAWBOT_AGENT_DIR="${FAWBOT_AGENT_DIR:-/home/zhangchi/project/fawbot_0410/fawtd_robot}"
 
 LOG_DIR="$VOICE_ROOT/log/startup"
 mkdir -p "$LOG_DIR"
@@ -41,8 +40,8 @@ _cleanup() {
   done
   wait "${BG_PIDS[@]}" 2>/dev/null || true
 
-  echo "正在停止 vLLM (start_services.py --stop-vllm)..."
-  (cd "$FAWBOT_AGENT_DIR" && conda run --no-capture-output -n fawbot-agent python scripts/start_services.py --stop-vllm) || true
+  echo "正在停止 Fawbot (start_services.py --stop)..."
+  (cd "$FAWBOT_AGENT_DIR" && conda run --no-capture-output -n fawbot-agent python scripts/start_services.py --stop) || true
 
   echo "已退出。"
 }
@@ -77,6 +76,15 @@ _launch() {
   echo "[$name] PID=${BG_PIDS[-1]}"
 }
 
+# ── 第一步：start_services.py --all（阻塞至就绪后自动退出）再起其余服务 ──────
+# 注意：不加 --daemon，脚本在所有服务就绪后自动退出，wait 才能返回
+_launch fawbot-start-services bash -c "cd \"$FAWBOT_AGENT_DIR\" && conda run --no-capture-output -n fawbot-agent python scripts/start_services.py --all"
+
+echo "[fawbot-start-services] 等待 start_services --all 完成..."
+wait "${BG_PIDS[-1]}" 2>/dev/null || true
+echo "[fawbot-start-services] 就绪，继续启动其余服务。"
+
+# ── 第二步：LiveKit / KWS / STT / TTS ───────────────────────────────────────
 _launch livekit-server livekit-server --dev --bind 0.0.0.0
 sleep 1
 
@@ -89,15 +97,8 @@ sleep 1
 _launch tts-server bash -c "cd \"$VOICE_ROOT\" && conda run --no-capture-output -n voice_system python tts/tts_server.py"
 sleep 1
 
-_launch fawbot-start-services bash -c "cd \"$FAWBOT_AGENT_DIR\" && conda run --no-capture-output -n fawbot-agent python scripts/start_services.py --vllm"
-
-# start_services.py --vllm 会阻塞直到 vLLM 就绪（最多 180s），需等它退出再启动 API server
-echo "[fawbot-start-services] 等待 vLLM 就绪..."
-wait "${BG_PIDS[-1]}" 2>/dev/null || true
-
-_launch fawbot-robot-api bash -c "cd \"$FAWBOT_AGENT_DIR\" && conda run --no-capture-output -n fawbot-agent python scripts/robot_api_server.py"
-sleep 1
-
+# ── 第三步：STT/LLM Agent ─────────────────────────────────────────────────────
+# fawbot-robot-api 已由 start_services.py --all 启动，无需重复拉起
 _launch stt-llm-agent bash -c "cd \"$VOICE_ROOT\" && conda run --no-capture-output -n livekit python server/stt_llm_agent.py start"
 
 echo ""
